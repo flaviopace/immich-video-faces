@@ -7,6 +7,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_USER="$(id -un)"
 CONFIG="$HOME/.config/immich-video-faces.env"
 
+# Block accidental commits of keys/config from this clone
+git -C "$DIR" config core.hooksPath .githooks 2>/dev/null || true
+
 echo "==> Installing ffmpeg and python3-requests"
 sudo apt-get update -qq
 sudo apt-get install -y ffmpeg python3-requests

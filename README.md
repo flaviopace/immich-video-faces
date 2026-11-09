@@ -129,6 +129,15 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 
 ## Development
 
+Secrets never belong in the repo: your URL and API key live only in
+`~/.config/immich-video-faces.env`, outside the repo. A commit hook blocks API
+keys, tokens, private keys, LAN IPs, `.env` and `.db` files. Turn it on once per clone
+(`install.sh` does this for you):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install requests
 .venv/bin/python -m unittest discover -s tests -v
