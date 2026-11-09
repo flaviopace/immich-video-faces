@@ -1,9 +1,13 @@
-"""A tiny in-memory stand-in for the parts of the Immich API the script uses."""
+"""A tiny in-memory stand-in for the parts of the Immich API the script uses.
+
+Uploaded frames go through a simulated background job (face detection) that can be slow,
+stuck, or failing, so the tests can check that the script waits for Immich properly."""
 from __future__ import annotations
 
 import json
 import re
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +15,8 @@ from urllib.parse import parse_qs, urlparse
 
 API_KEY = "test-key"
 OWNER = "user-1"
+QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration", "thumbnailGeneration", "faceDetection",
+          "facialRecognition", "smartSearch")
 
 
 class FakeImmich:
@@ -29,19 +35,37 @@ class FakeImmich:
                 "checksum": vid,
             }
         self.files = videos
-        self.uploads: dict[str, dict] = {}  # frame asset id -> form info
+        self.uploads: dict[str, dict] = {}  # frame asset id -> info
         self.deleted: list[str] = []
         self.created_faces: list[dict] = []
-        self.albums: dict[str, dict] = {}  # id -> {"name", "ids"}
+        self.albums: dict[str, dict] = {}  # id -> {"name", "description", "ids"}
         self.deleted_albums: list[str] = []
         self.video_faces: dict[str, list[dict]] = {}
+        # background job simulation
+        self.processing_delay = 0.0  # seconds before a frame's faces are ready
+        self.stuck = False  # jobs never finish
+        self.failing = False  # face detection jobs fail (no faces)
+        self.legacy = False  # old Immich: no /queues/{name}/jobs endpoint
+        self.job_listing_calls = 0
 
-    def faces_for_frame(self, index: int) -> list[dict]:
+    # --- simulation helpers
+    def ready(self, aid: str) -> bool:
+        if self.stuck or self.failing:
+            return False
+        return time.monotonic() >= self.uploads[aid]["ready_at"]
+
+    def pending_frames(self) -> list[str]:
+        return [a for a in self.uploads if a not in self.deleted and not self.failing and not self.ready(a)]
+
+    def faces_for_frame(self, aid: str) -> list[dict]:
+        if not self.ready(aid):
+            return []
+        index = self.uploads[aid]["index"]
         # every frame shows Alice; frame 1 also shows Bob (big); plus an unknown face
-        faces = [_face("p-alice", "Alice", 10, 10, 60, 60)]
+        faces = [_face(f"{aid}-0", "p-alice", "Alice", 10, 10, 60, 60)]
         if index == 1:
-            faces.append(_face("p-bob", "Bob", 100, 100, 300, 300))
-        faces.append(_face(None, None, 0, 0, 5, 5))
+            faces.append(_face(f"{aid}-1", "p-bob", "Bob", 100, 100, 300, 300))
+        faces.append(_face(f"{aid}-2", None, None, 0, 0, 5, 5))
         return faces
 
     def start(self):
@@ -79,14 +103,31 @@ class FakeImmich:
                 if p == "/api/users/me":
                     return self._json(200, {"id": OWNER})
                 if p == "/api/albums":
-                    return self._json(200, [{"id": k, "albumName": a["name"]} for k, a in fake.albums.items()])
+                    return self._json(200, [{"id": k, "albumName": a["name"], "description": a["description"],
+                                             "assetCount": len(a["ids"])} for k, a in fake.albums.items()])
                 if p == "/api/jobs":
-                    return self._json(200, {q: {"jobCounts": {"active": 0, "waiting": 0, "delayed": 0}}
-                                            for q in ("faceDetection", "facialRecognition")})
+                    counts = {q: {"jobCounts": {"active": 0, "waiting": 0, "delayed": 0, "paused": 0}} for q in QUEUES}
+                    counts["faceDetection"]["jobCounts"]["waiting"] = len(fake.pending_frames())
+                    return self._json(200, counts)
+                m = re.fullmatch(r"/api/queues/([^/]+)/jobs", p)
+                if m:
+                    if fake.legacy:
+                        return self._json(404, {"message": "Not found"})
+                    fake.job_listing_calls += 1
+                    statuses = parse_qs(url.query).get("status", [])
+                    if len(statuses) < 2:  # like the real API: a single value is not a list
+                        return self._json(400, {"message": "Validation failed"})
+                    jobs = []
+                    if m.group(1) == "faceDetection":
+                        if "waiting" in statuses:
+                            jobs += [{"name": "AssetDetectFaces", "data": {"id": a}} for a in fake.pending_frames()]
+                        if "failed" in statuses and fake.failing:
+                            jobs += [{"name": "AssetDetectFaces", "data": {"id": a}} for a in fake.uploads]
+                    return self._json(200, jobs)
                 if p == "/api/faces":
                     aid = parse_qs(url.query)["id"][0]
                     if aid in fake.uploads:
-                        return self._json(200, fake.faces_for_frame(fake.uploads[aid]["index"]))
+                        return self._json(200, fake.faces_for_frame(aid))
                     return self._json(200, fake.video_faces.get(aid, []))
                 m = re.fullmatch(r"/api/assets/([^/]+)/video/playback", p)
                 if m:
@@ -113,16 +154,18 @@ class FakeImmich:
                     return self._json(200, {"assets": {"items": items, "nextPage": None}, "albums": {}})
                 if p == "/api/assets":
                     name = re.search(rb'filename="([^"]+)"', raw).group(1).decode()
-                    video = name.split("_frame")[0]
-                    index = sum(1 for u in fake.uploads.values() if u["name"].split("_frame")[0] == video)
+                    video = name.rsplit("_t", 1)[0]
+                    index = sum(1 for u in fake.uploads.values() if u["name"].rsplit("_t", 1)[0] == video)
                     assert b'name="visibility"' in raw and b"archive" in raw
                     aid = str(uuid.uuid4())
-                    fake.uploads[aid] = {"name": name, "index": index, "size": len(raw)}
+                    fake.uploads[aid] = {"name": name, "index": index, "size": len(raw),
+                                         "ready_at": time.monotonic() + fake.processing_delay}
                     return self._json(201, {"id": aid, "status": "created"})
                 if p == "/api/albums":
                     body = json.loads(raw)
                     album_id = str(uuid.uuid4())
-                    fake.albums[album_id] = {"name": body["albumName"], "ids": []}
+                    fake.albums[album_id] = {"name": body["albumName"], "description": body.get("description", ""),
+                                             "ids": []}
                     return self._json(201, {"id": album_id})
                 if p == "/api/faces":
                     fake.created_faces.append(json.loads(raw))
@@ -164,9 +207,9 @@ class FakeImmich:
         self.server.shutdown()
 
 
-def _face(pid, name, x1, y1, x2, y2):
+def _face(face_id, pid, name, x1, y1, x2, y2):
     return {
-        "id": str(uuid.uuid4()),
+        "id": face_id,
         "imageWidth": 640,
         "imageHeight": 360,
         "boundingBoxX1": x1,

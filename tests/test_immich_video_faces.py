@@ -1,5 +1,4 @@
 import datetime as dt
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -16,7 +15,7 @@ import immich_video_faces as ivf  # noqa: E402
 from fake_immich import API_KEY, FakeImmich  # noqa: E402
 
 try:
-    import cv2  # noqa: F401
+    import cv2
     import numpy as np
 
     HAVE_CV2 = True
@@ -44,6 +43,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(ivf.frame_times(3, 24)), 6)  # max ~2 frames per second
         self.assertEqual(len(ivf.frame_times(0.3, 8)), 1)
 
+    def test_frame_name(self):
+        self.assertEqual(ivf.frame_name("20261108_180800", 10), "20261108_180800_t010.0s.jpg")
+
     def test_deadline_crosses_midnight(self):
         start = dt.datetime(2026, 1, 1, 23, 0)
         self.assertEqual(ivf.compute_deadline(dt.time(6, 0), start), dt.datetime(2026, 1, 2, 6, 0))
@@ -70,30 +72,28 @@ class HelperTests(unittest.TestCase):
 
     def test_select_frames_limit(self):
         frames = [frame(i, 100) for i in range(24)]
-        chosen = ivf.select_frames(frames, 6)
-        self.assertEqual(len(chosen), 6)
+        self.assertEqual(len(ivf.select_frames(frames, 6)), 6)
         self.assertEqual(ivf.select_frames([frame(i) for i in range(24)], 6), [])
-
-    def test_evenly(self):
-        frames = [frame(i) for i in range(10)]
-        self.assertEqual([f.at for f in ivf.evenly(frames, 5)], [0, 2, 4, 6, 8])
-        self.assertEqual(len(ivf.evenly(frames[:3], 5)), 3)
 
 
 @unittest.skipUnless(HAVE_CV2, "OpenCV not installed")
 class FaceFinderTests(unittest.TestCase):
     def test_blank_and_noise_frames_have_no_faces(self):
-        finder = ivf.FaceFinder(min_face_px=48)
+        finder = ivf.FaceFinder(min_face_px=20)
         tmp = Path(tempfile.mkdtemp())
         try:
             for name, img in {
-                "black.jpg": np.zeros((1080, 1920, 3), np.uint8),
-                "gray.jpg": np.full((1440, 1080, 3), 128, np.uint8),
+                "black.jpg": np.zeros((810, 1440, 3), np.uint8),
+                "gray.jpg": np.full((1440, 810, 3), 128, np.uint8),
                 "noise.jpg": np.random.default_rng(1).integers(0, 255, (720, 1280, 3), dtype=np.uint8),
             }.items():
                 cv2.imwrite(str(tmp / name), img)
-                self.assertEqual(finder.faces(tmp / name), [], name)
-            self.assertEqual(finder.faces(tmp / "missing.jpg"), [])
+                f = ivf.Frame(0, tmp / name)
+                finder.check(f)
+                self.assertEqual(f.faces, [], name)
+            missing = ivf.Frame(0, tmp / "missing.jpg")
+            finder.check(missing)
+            self.assertEqual(missing.faces, [])
         finally:
             shutil.rmtree(tmp)
 
@@ -113,12 +113,14 @@ class StateTests(unittest.TestCase):
             {"id": "done", "fileCreatedAt": "2023-01-01", "ownerId": "me"},
             {"id": "retry", "fileCreatedAt": "2025-01-01", "ownerId": "me"},
             {"id": "gave-up", "fileCreatedAt": "2025-01-01", "ownerId": "me"},
+            {"id": "waiting", "fileCreatedAt": "2025-02-01", "ownerId": "me"},
             {"id": "motion", "visibility": "hidden", "ownerId": "me"},
             {"id": "partner", "ownerId": "someone-else"},
         ]
         by_id = {v["id"]: v for v in videos}
         self.state.record(by_id["done"], "done")
         self.state.record(by_id["retry"], "failed", error="x")
+        self.state.record(by_id["waiting"], "waiting")
         for _ in range(3):
             self.state.record(by_id["gave-up"], "failed", error="x")
         picked = [v["id"] for v in ivf.pick_videos(videos, self.state, max_attempts=3, owner_id="me")]
@@ -132,9 +134,11 @@ class StateTests(unittest.TestCase):
         self.assertIsNotNone(self.state.get("b"))
 
     def test_pending_deletes(self):
-        self.state.add_pending_delete("f1", "v")
-        self.state.add_pending_delete("f2", "v")
+        self.state.add_pending_delete("f1", "v1")
+        self.state.add_pending_delete("f2", "v2")
         self.assertTrue(self.state.is_pending_delete("f1"))
+        self.assertEqual(self.state.pending_deletes("v2"), ["f2"])
+        self.assertEqual(self.state.pending_deletes(skip_videos=["v2"]), ["f1"])
         self.state.clear_pending_deletes(["f1"])
         self.assertEqual(self.state.pending_deletes(), ["f2"])
 
@@ -149,8 +153,9 @@ class StateTests(unittest.TestCase):
         db.close()
         state = ivf.State(old)
         state.record({"id": "w", "originalFileName": "w.mp4"}, "done", candidates=24, frames=2,
-                     faces_found=3, people_added=1, people_names=["Alice"])
+                     faces_found=3, faces_recognised=1, people_added=1, people_names=["Alice"])
         self.assertEqual(state.get("w")["people_names"], "Alice")
+        self.assertEqual(state.get("w")["faces_recognised"], 1)
         self.assertEqual(state.get("v")["status"], "done")
 
     def test_report(self):
@@ -158,22 +163,39 @@ class StateTests(unittest.TestCase):
         self.assertIn("did not run", ivf.build_report(self.state, since))
 
         run = self.state.start_run()
-        self.state.record({"id": "a", "originalFileName": "a.mp4"}, "done", candidates=24, frames=3,
-                          faces_found=5, people_added=2, people_names=["Alice", "Bob"])
-        self.state.record({"id": "b", "originalFileName": "b.mp4"}, "done", candidates=24, frames=0,
+        self.state.record({"id": "a", "originalFileName": "a.mp4"}, "done", candidates=29, frames=3,
+                          faces_found=5, faces_recognised=4, people_added=2, people_names=["Alice", "Bob"])
+        self.state.record({"id": "b", "originalFileName": "b.mp4"}, "done", candidates=19, frames=0,
                           faces_found=0, people_added=0)
         self.state.record({"id": "c", "originalFileName": "c.mp4"}, "failed", error="boom")
         self.state.finish_run(run)
         self.state.set_meta("remaining", "42")
         text = ivf.build_report(self.state, since)
         for expected in ("Videos processed: 2 (+1 failed)", "Videos with faces: 1", "Frames checked on the Pi: 48",
-                         "Frames uploaded to Immich: 3", "Faces detected by Immich: 5", "People added to videos: 2",
-                         "a.mp4: Alice, Bob", "c.mp4: boom", "All temporary frames deleted", "Videos left to scan: 42"):
+                         "Frames uploaded to Immich: 3", "Faces detected by Immich: 5 (4 recognised)",
+                         "People added to videos: 2", "a.mp4: Alice, Bob", "c.mp4: boom",
+                         "All temporary frames and albums deleted", "Videos left to scan: 42"):
             self.assertIn(expected, text)
         self.assertNotIn("did not run", text)
 
         self.state.add_pending_delete("f1", "a")
         self.assertIn("1 frame(s) still in Immich", ivf.build_report(self.state, since))
+        self.state.record({"id": "d", "originalFileName": "d.mp4"}, "waiting")
+        self.state.add_pending_delete("f2", "d")
+        text = ivf.build_report(self.state, since)
+        self.assertIn("1 video(s) still being processed by Immich", text)
+        self.assertIn("1 frame(s) still in Immich", text)  # frames of the waiting video are not "leftovers"
+
+
+class FakeFinder:
+    """Pretends faces are visible at second 3 and 7 of every video."""
+
+    def check(self, frame):
+        if round(frame.at) in (3, 7):
+            frame.faces = [5000.0]
+            frame.boxes = [(10, 10, 70, 70, 0.99, True)]
+        else:
+            frame.boxes = [(5, 5, 12, 12, 0.6, False)]
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
@@ -191,7 +213,7 @@ class EndToEndTests(unittest.TestCase):
             self.videos[vid] = path
         self.fake = FakeImmich(self.videos)
         # vid-a already shows Alice (from its thumbnail): only Bob should be added
-        self.fake.video_faces["vid-a"] = [{"person": {"id": "p-alice", "name": "Alice"}}]
+        self.fake.video_faces["vid-a"] = [{"id": "x", "person": {"id": "p-alice", "name": "Alice"}}]
         self.url = self.fake.start()
 
     def tearDown(self):
@@ -205,39 +227,44 @@ class EndToEndTests(unittest.TestCase):
         )
         orig = ivf.Config.__init__
 
-        def fast_init(cfg, *a, **kw):  # no real waiting in tests
+        def fast_init(cfg, *a, **kw):  # short waits in tests
             orig(cfg, *a, **kw)
-            cfg.poll_interval = 0
+            cfg.poll_interval = 0.05
             cfg.min_wait = 0
 
-        keys = ("IMMICH_URL", "IMMICH_API_KEY", "STATE_DB", "FACE_FILTER", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+        keys = ("IMMICH_URL", "IMMICH_API_KEY", "STATE_DB", "FACE_FILTER", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                "FACE_WAIT_TIMEOUT", "DEBUG_DIR")
         with mock.patch.object(ivf.Config, "__init__", fast_init), mock.patch.dict(ivf.os.environ):
             for key in keys:
                 ivf.os.environ.pop(key, None)
             return ivf.main(["--env-file", str(env_file), *extra])
 
+    def state(self):
+        return ivf.State(self.tmp / "state.db")
+
     def assert_cleaned_up(self):
         self.assertEqual(sorted(self.fake.deleted), sorted(self.fake.uploads))
-        self.assertEqual(self.fake.albums, {})  # temporary album removed
-        state = ivf.State(self.tmp / "state.db")
-        self.assertEqual(state.pending_deletes(), [])
+        self.assertEqual(self.fake.albums, {})  # per-video albums removed
+        self.assertEqual(self.state().pending_deletes(), [])
+
+    def people_on(self, vid):
+        return sorted(f["personId"] for f in self.fake.created_faces if f["assetId"] == vid)
 
     def test_full_run_without_face_check(self):
         self.assertEqual(self.run_script("--frames", "4", env="FACE_FILTER=off\n"), 0)
 
-        # 3 videos per run, newest first -> d, c, b
-        tagged = sorted({f["assetId"] for f in self.fake.created_faces})
-        self.assertEqual(tagged, ["vid-b", "vid-c", "vid-d"])
-        # each video gets Alice + Bob once; Bob using his biggest face box
-        for vid in tagged:
-            people = sorted(f["personId"] for f in self.fake.created_faces if f["assetId"] == vid)
-            self.assertEqual(people, ["p-alice", "p-bob"])
+        # 3 videos per run, newest first -> d, c, b; each gets Alice + Bob once
+        for vid in ("vid-b", "vid-c", "vid-d"):
+            self.assertEqual(self.people_on(vid), ["p-alice", "p-bob"])
+        self.assertEqual(self.people_on("vid-a"), [])
         bob = next(f for f in self.fake.created_faces if f["personId"] == "p-bob")
         self.assertEqual((bob["x"], bob["y"], bob["width"], bob["height"]), (100, 100, 200, 200))
 
-        # 4 frames per video, all deleted afterwards, album gone
+        # 4 frames per video; one album per video, named with date and video, deleted afterwards
         self.assertEqual(len(self.fake.uploads), 12)
-        self.assertEqual(self.fake.deleted_albums, ["Video face scan (temp)"])
+        self.assertEqual(len(self.fake.deleted_albums), 3)
+        for name in self.fake.deleted_albums:
+            self.assertRegex(name, r"^Video faces \d{4}-\d\d-\d\d \d\d:\d\d vid-[bcd]\.mp4$")
         self.assert_cleaned_up()
 
         # second run: only the remaining video, and Alice is not duplicated on it
@@ -260,25 +287,106 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.fake.uploads, {})
         self.assertEqual(self.fake.created_faces, [])
         self.assertEqual(self.fake.albums, {})  # album never even created
-        state = ivf.State(self.tmp / "state.db")
-        row = state.get("vid-d")
-        self.assertEqual((row["status"], row["candidates"], row["frames"]), ("done", 20, 0))
+        row = self.state().get("vid-d")
+        self.assertEqual(row["status"], "done")
+        self.assertGreaterEqual(row["candidates"], 9)  # one frame per second of the 10s video
+        self.assertEqual(row["frames"], 0)
 
     def test_only_frames_with_faces_are_uploaded(self):
-        class FakeFinder:
-            def faces(self, path):  # faces only in candidate frames 3 and 15
-                index = int(re.search(r"frame(\d+)", path.name).group(1))
-                return [5000.0] if index in (3, 15) else []
-
         with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
             self.assertEqual(self.run_script(), 0)
         names = sorted(u["name"] for u in self.fake.uploads.values())
-        self.assertEqual(names, [f"{v}_frame{i}.jpg" for v in ("vid-b", "vid-c", "vid-d") for i in ("03", "15")])
+        expected = [f"{v}_t{t}s.jpg" for v in ("vid-b", "vid-c", "vid-d") for t in ("003.0", "007.0")]
+        self.assertEqual(names, expected)
+        self.assert_cleaned_up()
+        row = self.state().get("vid-d")
+        self.assertEqual((row["frames"], row["people_names"], row["faces_recognised"]), (2, "Alice, Bob", 3))
+
+    def test_waits_for_immich_background_jobs(self):
+        # Immich needs a moment to detect faces: the script must wait for the job, not read too early
+        self.fake.processing_delay = 0.6
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        self.assertEqual(self.people_on("vid-d"), ["p-alice", "p-bob"])
+        self.assertGreater(self.fake.job_listing_calls, 0)  # it looked at Immich's queued jobs
         self.assert_cleaned_up()
 
-        state = ivf.State(self.tmp / "state.db")
-        row = state.get("vid-d")
-        self.assertEqual((row["candidates"], row["frames"], row["people_names"]), (20, 2, "Alice, Bob"))
+    def test_old_immich_without_job_listing(self):
+        # before v2.4 Immich can't list jobs: wait for its queues to be empty instead
+        self.fake.processing_delay = 0.6
+        self.fake.legacy = True
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        self.assertEqual(self.people_on("vid-d"), ["p-alice", "p-bob"])
+        self.assert_cleaned_up()
+
+    def test_immich_still_busy_results_collected_next_run(self):
+        self.fake.stuck = True
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "2", env="FACE_WAIT_TIMEOUT=1\n"), 0)
+        # nothing tagged yet, frames and albums kept, videos marked waiting
+        self.assertEqual(self.fake.created_faces, [])
+        self.assertEqual(self.fake.deleted, [])
+        self.assertEqual(len(self.fake.albums), 2)
+        self.assertEqual({r["asset_id"] for r in self.state().waiting_videos()}, {"vid-c", "vid-d"})
+        report = ivf.build_report(self.state(), "2000-01-01T00:00:00")
+        self.assertIn("2 video(s) still being processed by Immich", report)
+
+        # Immich catches up; the next run collects the results first, then cleans up
+        self.fake.stuck = False
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        for vid in ("vid-b", "vid-c", "vid-d"):
+            self.assertEqual(self.people_on(vid), ["p-alice", "p-bob"])
+        self.assertEqual(self.state().waiting_videos(), [])
+        self.assertEqual(self.state().get("vid-d")["people_names"], "Alice, Bob")
+        self.assert_cleaned_up()
+
+    def test_failed_immich_job_is_retried_not_marked_empty(self):
+        self.fake.failing = True
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 1)
+        row = self.state().get("vid-d")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("Immich failed", row["last_error"])
+        self.assert_cleaned_up()
+
+    def test_keep_frames_until_next_run(self):
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1", "--keep-frames"), 0)
+        self.assertEqual(self.people_on("vid-d"), ["p-alice", "p-bob"])
+        self.assertEqual(self.fake.deleted, [])
+        [album] = self.fake.albums.values()
+        self.assertTrue(album["name"].endswith("vid-d.mp4"))
+        self.assertEqual(len(album["ids"]), 2)
+        # the next run deletes them before doing anything else
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        self.assert_cleaned_up()
+
+    def test_debug_dir(self):
+        debug = self.tmp / "debug"
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1", "--debug-dir", str(debug)), 0)
+        [folder] = list(debug.iterdir())
+        self.assertRegex(folder.name, r"^\d{4}-\d\d-\d\d_\d{4}_vid-d$")
+        files = sorted(p.name for p in folder.iterdir())
+        self.assertIn("UPLOADED_vid-d_t003.0s.jpg", files)
+        self.assertIn("UPLOADED_vid-d_t007.0s.jpg", files)
+        self.assertIn("vid-d_t005.0s.jpg", files)
+        summary = (folder / "summary.txt").read_text()
+        self.assertIn("Alice", summary)
+        self.assertIn("people added to the video: Alice, Bob", summary)
+
+    def test_leftover_albums_cleaned_safely(self):
+        self.fake.albums = {
+            "a1": {"name": "Video faces 2026-01-01 03:00 old.mp4", "description": "frames from immich-video-faces",
+                   "ids": []},
+            "a2": {"name": "Video faces from my holiday", "description": "my own album", "ids": []},
+            "a3": {"name": "Holiday", "description": "mentions immich-video-faces", "ids": []},
+        }
+        self.assertEqual(self.run_script("--max-videos", "0"), 0)
+        self.assertEqual(sorted(self.fake.albums), ["a2", "a3"])
 
     def test_report_to_telegram(self):
         self.assertEqual(self.run_script("--frames", "2", env="FACE_FILTER=off\n"), 0)
@@ -290,7 +398,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual((token, chat), ("123:abc", "42"))
             self.assertIn("Videos processed: 3", text)
             self.assertIn("Videos left to scan: 1", text)
-            self.assertIn("All temporary frames deleted", text)
+            self.assertIn("All temporary frames and albums deleted", text)
             # next report only covers what happened after this one
             self.run_script("--report", env="TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=42\n")
             self.assertIn("did not run", sent[1][2])

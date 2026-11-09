@@ -4,12 +4,12 @@
 Immich only looks for faces in a video's thumbnail, so most people in a video
 are never recognised. For each video this script:
 
-  1. grabs candidate frames with ffmpeg (streamed from Immich, no full download)
-  2. checks them on the Pi with a small face detector and keeps only frames with faces
-  3. uploads those few frames to Immich as archived photos in a temporary album
+  1. grabs one frame per second with ffmpeg (streamed from Immich)
+  2. checks every frame for faces on the Pi (OpenCV) and keeps the best few frames with faces
+  3. uploads only those frames to Immich, archived, in a per-video album named with date and video
   4. waits for Immich to detect and recognise the faces in them
   5. adds every recognised person to the video itself
-  6. deletes the frames (and, at the end of the run, the temporary album)
+  6. deletes the frames and the album again
 
 Videos already scanned are remembered in a small SQLite database, so each run
 only handles new videos. `--report` sends a summary of the last night to Telegram.
@@ -31,11 +31,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 log = logging.getLogger("immich-video-faces")
 
@@ -43,9 +43,15 @@ HERE = Path(__file__).resolve().parent
 MODELS_DIR = HERE / "models"
 DEFAULT_ENV_FILE = Path.home() / ".config" / "immich-video-faces.env"
 DEFAULT_STATE_DB = Path.home() / ".local" / "share" / "immich-video-faces" / "state.db"
+# written in the description of every album we create, so leftovers can be found safely
+ALBUM_MARKER = "immich-video-faces"
 
-# Immich queues that must be empty before a frame is fully processed.
-WATCHED_QUEUES = ("metadataExtraction", "thumbnailGeneration", "faceDetection", "facialRecognition")
+# Immich's chain of background jobs for an uploaded photo, in order. Face recognition comes last,
+# with one job per face (archived photos get a second, "deferred" recognition job).
+PIPELINE_QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration", "thumbnailGeneration",
+                   "faceDetection")
+RECOGNITION_QUEUE = "facialRecognition"
+PENDING = ("active", "waiting", "delayed", "paused")
 
 
 # --------------------------------------------------------------------------- config
@@ -57,15 +63,19 @@ class Config:
     api_key: str
     state_db: Path = DEFAULT_STATE_DB
     max_videos: int = 3
-    candidate_frames: int = 24  # frames checked on the Pi per video
+    candidate_interval: float = 1.0  # seconds between frames checked on the Pi
+    candidate_max: int = 90  # cap per video (long videos get a wider interval)
+    one_pass_max_seconds: int = 180  # videos up to this length are read in one fast pass
     frames_per_video: int = 6  # max frames uploaded to Immich per video
     frame_max_size: int = 1440  # longest side; Immich analyses a 1440px preview anyway
-    face_filter: str = "auto"  # auto: use OpenCV if installed | off: upload without checking
-    min_face_px: int = 48  # smaller faces are too small for Immich to recognise
-    album_name: str = "Video face scan (temp)"
+    face_filter: str = "auto"  # auto: check frames with OpenCV if installed | off: upload without checking
+    min_face_px: int = 20  # smaller faces are ignored
+    face_score: float = 0.9  # Pi detector confidence needed to count a face
+    album_prefix: str = "Video faces"
+    debug_dir: Optional[Path] = None  # keep annotated frames here for inspection
     face_wait_timeout: int = 900  # max seconds to wait for Immich per video
-    poll_interval: int = 15
-    min_wait: int = 60  # never decide "done" before this many seconds
+    poll_interval: int = 10
+    min_wait: int = 20  # never decide "done" before this many seconds
     settle_time: int = 180  # used when queue status can't be read (non-admin key)
     max_attempts: int = 3
     stop_after: Optional[dt.time] = None
@@ -109,12 +119,17 @@ def build_config(args: argparse.Namespace) -> Config:
     if env.get("STATE_DB"):
         cfg.state_db = Path(env["STATE_DB"]).expanduser()
     cfg.max_videos = int(env.get("MAX_VIDEOS", cfg.max_videos))
-    cfg.candidate_frames = int(env.get("CANDIDATE_FRAMES", cfg.candidate_frames))
+    cfg.candidate_interval = float(env.get("CANDIDATE_INTERVAL", cfg.candidate_interval))
+    cfg.candidate_max = int(env.get("CANDIDATE_MAX", cfg.candidate_max))
+    cfg.one_pass_max_seconds = int(env.get("ONE_PASS_MAX_SECONDS", cfg.one_pass_max_seconds))
     cfg.frames_per_video = int(env.get("FRAMES_PER_VIDEO", cfg.frames_per_video))
     cfg.frame_max_size = int(env.get("FRAME_MAX_SIZE", cfg.frame_max_size))
     cfg.face_filter = env.get("FACE_FILTER", cfg.face_filter).strip().lower()
     cfg.min_face_px = int(env.get("MIN_FACE_PX", cfg.min_face_px))
-    cfg.album_name = env.get("ALBUM_NAME", cfg.album_name)
+    cfg.face_score = float(env.get("FACE_SCORE", cfg.face_score))
+    cfg.album_prefix = env.get("ALBUM_PREFIX", cfg.album_prefix).strip() or cfg.album_prefix
+    if env.get("DEBUG_DIR"):
+        cfg.debug_dir = Path(env["DEBUG_DIR"]).expanduser()
     cfg.face_wait_timeout = int(env.get("FACE_WAIT_TIMEOUT", cfg.face_wait_timeout))
     cfg.max_attempts = int(env.get("MAX_ATTEMPTS", cfg.max_attempts))
     if env.get("STOP_AFTER"):
@@ -129,6 +144,8 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.frames_per_video = args.frames
     if args.keep_frames:
         cfg.keep_frames = True
+    if args.debug_dir:
+        cfg.debug_dir = args.debug_dir.expanduser()
     return cfg
 
 
@@ -151,6 +168,7 @@ class ImmichClient:
         self.timeout = timeout
         self.major_version = 0
         self._can_read_queues = True
+        self._can_list_jobs = True
         self.session = requests.Session()
         self.session.headers.update({"x-api-key": api_key, "Accept": "application/json"})
 
@@ -227,25 +245,11 @@ class ImmichClient:
         # force=True skips the trash, so frames vanish for good
         self._call("DELETE", "/assets", json={"ids": list(ids), "force": True})
 
-    def find_album(self, name: str) -> Optional[str]:
-        for album in self._call("GET", "/albums") or []:
-            if album.get("albumName") == name:
-                return album["id"]
-        return None
+    def list_albums(self) -> List[dict]:
+        return self._call("GET", "/albums") or []
 
-    def find_or_create_album(self, name: str) -> str:
-        album_id = self.find_album(name)
-        if album_id:
-            return album_id
-        album = self._call(
-            "POST",
-            "/albums",
-            json={
-                "albumName": name,
-                "description": "Temporary video frames used by immich-video-faces. Deleted after each run.",
-            },
-        )
-        return album["id"]
+    def create_album(self, name: str, description: str) -> str:
+        return self._call("POST", "/albums", json={"albumName": name, "description": description})["id"]
 
     def delete_album(self, album_id: str) -> None:
         # removes the album only; assets in it are not touched
@@ -254,23 +258,42 @@ class ImmichClient:
     def add_to_album(self, album_id: str, ids: List[str]) -> None:
         self._call("PUT", f"/albums/{album_id}/assets", json={"ids": ids})
 
-    def queues_busy(self) -> Optional[bool]:
-        """True/False if Immich is still processing; None if we can't tell (non-admin key)."""
+    def queue_counts(self) -> Optional[Dict[str, int]]:
+        """Pending jobs per queue; None if the key can't see Immich's jobs (needs an admin user)."""
         if not self._can_read_queues:
             return None
         try:
             queues = self._call("GET", "/jobs")
         except ImmichError as e:
             if e.status in (401, 403):
-                log.info("API key can't read job queues (needs an admin user + job.read); using timed waits")
+                log.info("API key can't read Immich's jobs (needs an admin user + job.read); using timed waits")
                 self._can_read_queues = False
                 return None
             raise
-        pending = 0
-        for name in WATCHED_QUEUES:
+        out = {}
+        for name in PIPELINE_QUEUES + (RECOGNITION_QUEUE,):
             counts = (queues.get(name) or {}).get("jobCounts") or {}
-            pending += sum(int(counts.get(k) or 0) for k in ("active", "waiting", "delayed"))
-        return pending > 0
+            out[name] = sum(int(counts.get(k) or 0) for k in PENDING)
+        return out
+
+    def queue_job_ids(self, queue: str, statuses: Iterable[str]) -> Optional[Set[str]]:
+        """The asset/face id of every job in `queue` with one of `statuses`.
+
+        None if this Immich can't list jobs (before v2.4, or missing queueJob.read permission)."""
+        if not self._can_list_jobs:
+            return None
+        params = [("status", s) for s in statuses]
+        if len(params) == 1:
+            params.append(params[0])  # the API only accepts a list: repeat a single value
+        try:
+            jobs = self._call("GET", f"/queues/{queue}/jobs", params=params, timeout=120)
+        except ImmichError as e:
+            if e.status in (400, 401, 403, 404):
+                log.info("Immich can't list its queued jobs (HTTP %s); waiting for empty queues instead", e.status)
+                self._can_list_jobs = False
+                return None
+            raise
+        return {str(job["data"]["id"]) for job in jobs or [] if (job.get("data") or {}).get("id")}
 
     def video_url(self, asset_id: str) -> str:
         # playback = Immich's transcoded copy if there is one (smaller, SDR), else the original
@@ -293,7 +316,7 @@ CREATE TABLE IF NOT EXISTS videos (
     asset_id     TEXT PRIMARY KEY,
     file_name    TEXT,
     checksum     TEXT,
-    status       TEXT NOT NULL,          -- done | failed
+    status       TEXT NOT NULL,          -- done | failed | waiting (Immich still busy, finish next run)
     attempts     INTEGER NOT NULL DEFAULT 0,
     frames       INTEGER,                -- frames uploaded to Immich
     faces_found  INTEGER,                -- faces Immich detected in those frames
@@ -323,6 +346,7 @@ CREATE TABLE IF NOT EXISTS meta (
 MIGRATIONS = [
     ("videos", "candidates", "INTEGER"),  # frames checked on the Pi
     ("videos", "people_names", "TEXT"),
+    ("videos", "faces_recognised", "INTEGER"),
 ]
 
 
@@ -352,8 +376,8 @@ class State:
             self.db.execute(
                 """INSERT OR REPLACE INTO videos
                    (asset_id, file_name, checksum, status, attempts, candidates, frames, faces_found,
-                    people_added, people_names, last_error, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    faces_recognised, people_added, people_names, last_error, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     video["id"],
                     video.get("originalFileName"),
@@ -363,6 +387,7 @@ class State:
                     stats.get("candidates"),
                     stats.get("frames"),
                     stats.get("faces_found"),
+                    stats.get("faces_recognised"),
                     stats.get("people_added"),
                     ", ".join(stats.get("people_names") or []) or None,
                     error,
@@ -392,8 +417,16 @@ class State:
     def is_pending_delete(self, asset_id: str) -> bool:
         return self.db.execute("SELECT 1 FROM pending_deletes WHERE asset_id = ?", (asset_id,)).fetchone() is not None
 
-    def pending_deletes(self) -> List[str]:
-        return [r["asset_id"] for r in self.db.execute("SELECT asset_id FROM pending_deletes")]
+    def pending_deletes(self, video_id: Optional[str] = None, skip_videos: Iterable[str] = ()) -> List[str]:
+        if video_id:
+            rows = self.db.execute("SELECT asset_id, video_id FROM pending_deletes WHERE video_id = ?", (video_id,))
+        else:
+            rows = self.db.execute("SELECT asset_id, video_id FROM pending_deletes")
+        skip = set(skip_videos)
+        return [r["asset_id"] for r in rows if r["video_id"] not in skip]
+
+    def waiting_videos(self) -> List[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM videos WHERE status = 'waiting'").fetchall()
 
     def clear_pending_deletes(self, ids: List[str]) -> None:
         with self.db:
@@ -434,7 +467,7 @@ def pick_videos(videos: List[dict], state: State, max_attempts: int, owner_id: O
         row = state.get(v["id"])
         if row is None:
             new.append(v)
-        elif row["status"] != "done" and row["attempts"] < max_attempts:
+        elif row["status"] == "failed" and row["attempts"] < max_attempts:
             retry.append(v)
 
     def newest_first(v: dict) -> str:
@@ -452,7 +485,8 @@ def pick_videos(videos: List[dict], state: State, max_attempts: int, owner_id: O
 class Frame:
     at: float  # seconds into the video
     path: Path
-    faces: List[float] = field(default_factory=list)  # area (px²) of each face found on the Pi
+    faces: List[float] = field(default_factory=list)  # area (px²) of each usable face found on the Pi
+    boxes: List[Tuple] = field(default_factory=list)  # (x, y, w, h, score, usable) for the debug images
 
 
 def parse_duration(value) -> float:
@@ -475,6 +509,15 @@ def frame_times(duration: float, count: int) -> List[float]:
     return sorted({round(start + span * (i + 0.5) / count, 3) for i in range(count)})
 
 
+def frame_name(stem: str, at: float) -> str:
+    return f"{stem}_t{at:05.1f}s.jpg"  # e.g. 20261108_180800_t010.0s.jpg
+
+
+def scale_filter(max_size: int) -> str:
+    # limit the longest side, keep aspect ratio (works for portrait and landscape)
+    return f"scale='if(gte(iw,ih),min({max_size},iw),-2)':'if(gte(iw,ih),-2,min({max_size},ih))'"
+
+
 def probe_duration(source: str, input_args: List[str]) -> float:
     cmd = ["ffprobe", "-v", "error", *input_args, "-show_entries", "format=duration",
            "-of", "default=noprint_wrappers=1:nokey=1", source]
@@ -486,12 +529,10 @@ def probe_duration(source: str, input_args: List[str]) -> float:
 
 
 def extract_frame(source: str, input_args: List[str], at: float, dest: Path, max_size: int) -> bool:
-    # limit the longest side, keep aspect ratio (works for portrait and landscape)
-    scale = f"scale='if(gte(iw,ih),min({max_size},iw),-2)':'if(gte(iw,ih),-2,min({max_size},ih))'"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         *input_args, "-ss", f"{at:.3f}", "-i", source,
-        "-frames:v", "1", "-vf", scale, "-q:v", "3",
+        "-frames:v", "1", "-vf", scale_filter(max_size), "-q:v", "3",
         str(dest),
     ]
     try:
@@ -504,15 +545,67 @@ def extract_frame(source: str, input_args: List[str], at: float, dest: Path, max
     return res.returncode == 0 and dest.exists() and dest.stat().st_size > 0
 
 
-def extract_frames(client: ImmichClient, video: dict, workdir: Path, count: int, max_size: int) -> List[Frame]:
+def grab_one_pass(source: str, input_args: List[str], interval: float, limit: int,
+                  stem: str, workdir: Path, max_size: int) -> List[Frame]:
+    """Read the video once and keep one frame every `interval` seconds (fast for short videos)."""
+    raw = workdir / "raw"
+    raw.mkdir(exist_ok=True)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        *input_args, "-i", source,
+        "-vf", f"fps={1 / interval:.6g},{scale_filter(max_size)}", "-frames:v", str(limit), "-q:v", "3",
+        str(raw / "%05d.jpg"),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if res.returncode != 0:
+            log.debug("ffmpeg one-pass failed: %s", res.stderr.strip()[:300])
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg timed out reading the video")
+    frames = []
+    for path in sorted(raw.glob("*.jpg")):
+        at = (int(path.stem) - 1) * interval
+        dest = workdir / frame_name(stem, at)
+        path.rename(dest)
+        frames.append(Frame(at, dest))
+    shutil.rmtree(raw, ignore_errors=True)
+    return frames
+
+
+def grab_seeking(source: str, input_args: List[str], duration: float, count: int,
+                 stem: str, workdir: Path, max_size: int) -> List[Frame]:
+    """Jump to `count` evenly spaced positions (for long videos: reads only what's needed)."""
+    frames = []
+    for at in frame_times(duration, count):
+        dest = workdir / frame_name(stem, at)
+        if extract_frame(source, input_args, at, dest, max_size):
+            frames.append(Frame(at, dest))
+    return frames
+
+
+def grab_frames(source: str, input_args: List[str], duration: float, cfg: Config,
+                dense: bool, stem: str, workdir: Path) -> List[Frame]:
+    if not dense:  # no face check: only the frames we will upload
+        return grab_seeking(source, input_args, duration, cfg.frames_per_video, stem, workdir, cfg.frame_max_size)
+    if duration <= cfg.one_pass_max_seconds:
+        interval = cfg.candidate_interval
+        if duration > 0:
+            interval = max(interval, duration / cfg.candidate_max)
+        frames = grab_one_pass(source, input_args, interval, cfg.candidate_max, stem, workdir, cfg.frame_max_size)
+        if frames:
+            return frames
+    count = min(cfg.candidate_max, max(1, int(duration / cfg.candidate_interval)))
+    return grab_seeking(source, input_args, duration, count, stem, workdir, cfg.frame_max_size)
+
+
+def extract_frames(client: ImmichClient, video: dict, workdir: Path, cfg: Config, dense: bool) -> List[Frame]:
     stem = Path(video.get("originalFileName") or video["id"]).stem
-    # Stream straight from Immich: ffmpeg seeks with HTTP range requests, so only
-    # the needed parts of the video are read.
+    # Stream straight from Immich; nothing is stored on the Pi's disk.
     source = client.video_url(video["id"])
     input_args = ["-headers", f"x-api-key: {client.api_key}\r\n"]
     duration = parse_duration(video.get("duration")) or probe_duration(source, input_args)
 
-    frames = _grab(source, input_args, duration, count, stem, workdir, max_size)
+    frames = grab_frames(source, input_args, duration, cfg, dense, stem, workdir)
     if frames:
         return frames
 
@@ -522,24 +615,13 @@ def extract_frames(client: ImmichClient, video: dict, workdir: Path, count: int,
         local = download_dir / "original"
         client.download_original(video["id"], local)
         duration = duration or probe_duration(str(local), [])
-        return _grab(str(local), [], duration, count, stem, workdir, max_size)
+        return grab_frames(str(local), [], duration, cfg, dense, stem, workdir)
     finally:
         shutil.rmtree(download_dir, ignore_errors=True)
 
 
-def _grab(source, input_args, duration, count, stem, workdir, max_size) -> List[Frame]:
-    frames = []
-    for i, at in enumerate(frame_times(duration, count)):
-        dest = workdir / f"{stem}_frame{i:02d}.jpg"
-        if extract_frame(source, input_args, at, dest, max_size):
-            frames.append(Frame(at, dest))
-    return frames
-
-
 class FaceFinder:
-    """Fast face check on the Pi (OpenCV YuNet), used to skip frames without faces."""
-
-    DETECT_SIZE = 640  # frames are shrunk to this for detection: fast, still finds small faces
+    """Face check on the Pi (OpenCV YuNet), used to upload only frames that contain faces."""
 
     def __init__(self, min_face_px: int, score: float = 0.9):
         import cv2  # noqa: optional dependency (apt install python3-opencv)
@@ -548,36 +630,38 @@ class FaceFinder:
         # the 2023 model needs OpenCV >= 4.8; older OpenCV only runs the 2022 model
         model = "face_detection_yunet_2023mar.onnx" if version >= (4, 8) else "face_detection_yunet_2022mar.onnx"
         self.cv2 = cv2
-        self.detector = cv2.FaceDetectorYN.create(str(MODELS_DIR / model), "", (320, 320), score)
+        # low threshold here so weak hits can be shown in the debug images; `score` decides
+        self.detector = cv2.FaceDetectorYN.create(str(MODELS_DIR / model), "", (320, 320), 0.5)
         self.min_face_px = min_face_px
+        self.score = score
         log.debug("face check: OpenCV %s, %s", cv2.__version__, model)
 
-    def faces(self, path: Path) -> List[float]:
-        img = self.cv2.imread(str(path))
+    def check(self, frame: Frame) -> None:
+        """Fill frame.boxes (everything seen) and frame.faces (faces good enough to upload for)."""
+        img = self.cv2.imread(str(frame.path))
         if img is None:
-            return []
+            return
         h, w = img.shape[:2]
-        scale = min(1.0, self.DETECT_SIZE / max(w, h))
-        if scale < 1.0:
-            img = self.cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))))
-        self.detector.setInputSize((img.shape[1], img.shape[0]))
+        # full resolution: faces in videos are often only 20-40px wide
+        self.detector.setInputSize((w, h))
         _, found = self.detector.detect(img)
-        areas = []
-        for face in [] if found is None else found:
-            fw, fh = face[2] / scale, face[3] / scale
-            if min(fw, fh) < self.min_face_px:
-                continue  # too small for Immich to recognise
-            if fw > 0.9 * w and fh > 0.9 * h:
-                continue  # whole-frame false positive (e.g. black frame)
-            areas.append(float(fw * fh))
-        return areas
+        for f in [] if found is None else found:
+            x, y, fw, fh, score = int(f[0]), int(f[1]), float(f[2]), float(f[3]), float(f[-1])
+            usable = (
+                score >= self.score
+                and min(fw, fh) >= self.min_face_px
+                and not (fw > 0.9 * w and fh > 0.9 * h)  # whole-frame false positive (e.g. black frame)
+            )
+            frame.boxes.append((x, y, int(fw), int(fh), score, usable))
+            if usable:
+                frame.faces.append(fw * fh)
 
 
 def load_face_finder(cfg: Config) -> Optional[FaceFinder]:
     if cfg.face_filter == "off":
         return None
     try:
-        return FaceFinder(cfg.min_face_px)
+        return FaceFinder(cfg.min_face_px, cfg.face_score)
     except Exception as e:  # ImportError, missing model, ...
         log.warning("Face check on the Pi unavailable (%s); uploading frames without checking", e)
         return None
@@ -598,48 +682,108 @@ def select_frames(frames: List[Frame], limit: int) -> List[Frame]:
     return sorted(best.values(), key=lambda f: f.at)
 
 
-def evenly(frames: List[Frame], limit: int) -> List[Frame]:
-    if len(frames) <= limit:
-        return frames
-    return [frames[i * len(frames) // limit] for i in range(limit)]
-
-
-def work_dir() -> Path:
-    """Frames live in RAM (/dev/shm) when possible, to spare the Pi's SD card."""
+def work_dir(label: str) -> Path:
+    """Per-video temp folder, in RAM (/dev/shm) when possible to spare the Pi's SD card."""
     shm = Path("/dev/shm")
-    base = str(shm) if shm.is_dir() and os.access(shm, os.W_OK) else None
-    return Path(tempfile.mkdtemp(prefix="immich-video-faces-", dir=base))
+    base = shm if shm.is_dir() and os.access(shm, os.W_OK) else Path(tempfile.gettempdir())
+    path = base / "immich-video-faces" / label
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True)
+    return path
+
+
+def write_debug_frames(folder: Path, frames: List[Frame], chosen: List[Frame]) -> None:
+    """Copy every checked frame to `folder`, with the faces found drawn on it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    chosen_paths = {f.path for f in chosen}
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None
+    for frame in frames:
+        name = ("UPLOADED_" if frame.path in chosen_paths else "") + frame.path.name
+        if cv2 is None:
+            shutil.copy(frame.path, folder / name)
+            continue
+        img = cv2.imread(str(frame.path))
+        if img is None:
+            continue
+        for x, y, w, h, score, usable in frame.boxes:
+            color = (0, 200, 0) if usable else (0, 165, 255)  # green = counted, orange = ignored
+            cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(img, f"{score:.2f} {w}px", (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.imwrite(str(folder / name), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
 # --------------------------------------------------------------------------- faces
 
 
-def wait_for_faces(client: ImmichClient, frame_ids: List[str], cfg: Config) -> Dict[str, List[dict]]:
-    """Poll until Immich has finished detecting + recognising faces in the frames."""
+def _jobs_pending(client: ImmichClient, queues: Iterable[str], ids: Set[str]) -> bool:
+    """Is any job for `ids` still queued or running in `queues`?"""
+    counts = client.queue_counts() or {}
+    for queue in queues:
+        if not counts.get(queue):
+            continue
+        listed = client.queue_job_ids(queue, PENDING)
+        if listed is None or listed & ids:
+            return True  # can't see which jobs are queued (old Immich): wait for an empty queue
+    return False
+
+
+def check_immich(client: ImmichClient, frame_ids: List[str]) -> Tuple[Dict[str, List[dict]], Optional[bool]]:
+    """Faces per frame, and whether Immich has finished every background job for these frames.
+
+    True/False, or None when the API key can't see Immich's jobs (non-admin)."""
+    if client.queue_counts() is None:
+        return {fid: client.get_faces(fid) for fid in frame_ids}, None
+    # 1. frames still going through metadata -> thumbnails -> face detection?
+    if _jobs_pending(client, PIPELINE_QUEUES, set(frame_ids)):
+        return {fid: client.get_faces(fid) for fid in frame_ids}, False
+    # 2. detection is done, so the faces are final; is any of them still being recognised?
+    faces = {fid: client.get_faces(fid) for fid in frame_ids}
+    face_ids = {str(f["id"]) for per_frame in faces.values() for f in per_frame}
+    return faces, not _jobs_pending(client, (RECOGNITION_QUEUE,), face_ids)
+
+
+def failed_frames(client: ImmichClient, frame_ids: List[str]) -> Set[str]:
+    """Frames whose thumbnail or face detection job failed in Immich (e.g. machine learning down)."""
+    failed: Set[str] = set()
+    for queue in PIPELINE_QUEUES:
+        failed |= (client.queue_job_ids(queue, ("failed",)) or set()) & set(frame_ids)
+    return failed
+
+
+def wait_for_faces(client: ImmichClient, frame_ids: List[str], cfg: Config) -> Tuple[Dict[str, List[dict]], bool]:
+    """Wait until Immich has finished its background face jobs for the frames.
+
+    Returns the faces per frame and whether Immich finished (False = still busy at the timeout)."""
     start = time.monotonic()
+    previous = None
     last_seen, last_change = None, start
     while True:
         time.sleep(cfg.poll_interval)
-        faces = {fid: client.get_faces(fid) for fid in frame_ids}
+        faces, done = check_immich(client, frame_ids)
         found = [f for per_frame in faces.values() for f in per_frame]
         assigned = sum(1 for f in found if f.get("person"))
+        signature = sorted((str(f["id"]), str((f.get("person") or {}).get("id"))) for f in found)
         now = time.monotonic()
         elapsed = now - start
-        if (len(found), assigned) != last_seen:
-            last_seen, last_change = (len(found), assigned), now
-        busy = client.queues_busy()
-        log.debug("  %3ds: %d faces, %d recognised, immich busy=%s", elapsed, len(found), assigned, busy)
+        log.debug("  %3ds: %d faces, %d recognised, immich done=%s", elapsed, len(found), assigned, done)
 
-        if elapsed >= cfg.min_wait:
-            if busy is False:
-                return faces
-            if busy is None and found and assigned == len(found):
-                return faces
-            if busy is None and now - last_change >= cfg.settle_time:
-                return faces
+        if done is not None:
+            # finished twice in a row with the same result: nothing can still change
+            if done and signature == previous:
+                return faces, True
+            previous = signature if done else None
+        else:  # non-admin key: no view of Immich's jobs, wait until results stop changing
+            if signature != last_seen:
+                last_seen, last_change = signature, now
+            if elapsed >= cfg.min_wait and found and assigned == len(found):
+                return faces, True
+            if elapsed >= cfg.min_wait and now - last_change >= cfg.settle_time:
+                return faces, True
         if elapsed >= cfg.face_wait_timeout:
-            log.warning("Gave up waiting for Immich after %ds; using what was found so far", elapsed)
-            return faces
+            return faces, False
 
 
 def best_face_per_person(frame_faces: Dict[str, List[dict]]) -> Dict[str, dict]:
@@ -668,46 +812,114 @@ def copy_people_to_video(client: ImmichClient, video_id: str, frame_faces: Dict[
     return added
 
 
+def describe_faces(faces: List[dict]) -> str:
+    if not faces:
+        return "no face"
+    names = [(f.get("person") or {}).get("name") or ("unnamed person" if f.get("person") else "not recognised")
+             for f in faces]
+    return f"{len(faces)} face(s): " + ", ".join(names)
+
+
 # --------------------------------------------------------------------------- run
 
 
-def delete_frames(client: ImmichClient, state: State, ids: List[str]) -> None:
+def delete_frames(client: ImmichClient, state: State, ids: List[str]) -> bool:
     if not ids:
-        return
+        return True
     try:
         client.delete_assets(ids)
         state.clear_pending_deletes(ids)
         log.info("  deleted %d frame(s) from Immich", len(ids))
+        return True
     except Exception as e:  # keep going; next run retries
         log.warning("Could not delete %d frame(s), will retry next run: %s", len(ids), e)
+        return False
 
 
-def process_video(client: ImmichClient, state: State, cfg: Config, album: "AlbumHolder",
-                  finder: Optional[FaceFinder], video: dict) -> bool:
+def harvest_waiting(client: ImmichClient, state: State, cfg: Config) -> Set[str]:
+    """Finish videos whose frames Immich was still processing at the end of an earlier run.
+
+    Returns the ids of videos that are still waiting (their frames must be kept)."""
+    still_waiting = set()
+    for row in state.waiting_videos():
+        video = {"id": row["asset_id"], "originalFileName": row["file_name"], "checksum": row["checksum"]}
+        frame_ids = state.pending_deletes(row["asset_id"])
+        if not frame_ids:
+            state.record(video, "failed", error="temporary frames were lost before Immich finished")
+            continue
+        faces, done = check_immich(client, frame_ids)
+        if done is False:
+            if row["attempts"] >= cfg.max_attempts:
+                state.record(video, "failed", error="Immich did not finish the frames in time")
+            else:
+                log.info("Immich is still busy with %s, collecting next run", row["file_name"])
+                state.record(video, "waiting", candidates=row["candidates"], frames=row["frames"])
+                still_waiting.add(row["asset_id"])
+            continue
+        found = sum(len(f) for f in faces.values())
+        recognised = sum(1 for per_frame in faces.values() for f in per_frame if f.get("person"))
+        added = copy_people_to_video(client, row["asset_id"], faces)
+        log.info("Collected %s from an earlier run: %d face(s), %d recognised, people added: %s",
+                 row["file_name"], found, recognised, ", ".join(added) or "none")
+        state.record(video, "done", candidates=row["candidates"], frames=len(frame_ids), faces_found=found,
+                     faces_recognised=recognised, people_added=len(added), people_names=added)
+    return still_waiting
+
+
+def cleanup_leftovers(client: ImmichClient, state: State, cfg: Config) -> None:
+    """Finish or delete what an earlier run left behind (Immich busy, crash, network loss, --keep-frames)."""
+    still_waiting = harvest_waiting(client, state, cfg)
+    delete_frames(client, state, state.pending_deletes(skip_videos=still_waiting))
+    if state.pending_deletes():
+        return  # some frames are still in Immich: keep the albums too
+    for album in client.list_albums():
+        name = album.get("albumName") or ""
+        if name.startswith(cfg.album_prefix) and ALBUM_MARKER in (album.get("description") or ""):
+            try:
+                client.delete_album(album["id"])
+                log.info("Deleted leftover album %r", name)
+            except ImmichError as e:
+                log.warning("Could not delete album %r: %s", name, e)
+
+
+def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optional[FaceFinder],
+                  video: dict) -> bool:
     name = video.get("originalFileName") or video["id"]
+    stem = Path(name).stem
+    started = dt.datetime.now()
+    label = f"{started:%Y-%m-%d_%H%M}_{stem}"  # folder names: date + video, easy to find
     log.info("Scanning %s (%s)", name, video["id"])
     uploaded: List[str] = []
-    workdir = work_dir()
+    album_id: Optional[str] = None
+    keep_for_later = False
+    debug_folder = cfg.debug_dir / label if cfg.debug_dir else None
+    workdir = work_dir(label)
     try:
-        count = cfg.candidate_frames if finder else cfg.frames_per_video
-        candidates = extract_frames(client, video, workdir, count, cfg.frame_max_size)
+        t0 = time.monotonic()
+        candidates = extract_frames(client, video, workdir, cfg, dense=finder is not None)
         if not candidates:
             raise RuntimeError("could not extract any frame")
 
         if finder:
             for frame in candidates:
-                frame.faces = finder.faces(frame.path)
+                finder.check(frame)
             chosen = select_frames(candidates, cfg.frames_per_video)
-            log.info("  checked %d frame(s) on the Pi, %d with faces, uploading %d",
-                     len(candidates), sum(1 for f in candidates if f.faces), len(chosen))
-            if not chosen:
-                state.record(video, "done", candidates=len(candidates), frames=0, faces_found=0, people_added=0)
-                log.info("  no faces in this video, nothing uploaded")
-                return True
+            log.info("  checked %d frame(s) on the Pi in %.0fs, %d with faces, uploading %d: %s",
+                     len(candidates), time.monotonic() - t0, sum(1 for f in candidates if f.faces), len(chosen),
+                     ", ".join(f"{f.at:.0f}s ({len(f.faces)} faces)" for f in chosen) or "-")
         else:
-            chosen = evenly(candidates, cfg.frames_per_video)
+            chosen = candidates
+        if debug_folder:
+            write_debug_frames(debug_folder, candidates, chosen)
+            log.info("  debug frames saved in %s", debug_folder)
+        if not chosen:
+            state.record(video, "done", candidates=len(candidates), frames=0, faces_found=0,
+                         faces_recognised=0, people_added=0)
+            log.info("  no faces in this video, nothing uploaded")
+            return True
 
         created_at = video.get("fileCreatedAt") or dt.datetime.now(dt.timezone.utc).isoformat()
+        names = {}
         for frame in chosen:
             asset_id, status = client.upload_frame(frame.path, created_at)
             if status == "duplicate" and not state.is_pending_delete(asset_id):
@@ -716,27 +928,45 @@ def process_video(client: ImmichClient, state: State, cfg: Config, album: "Album
                 continue
             state.add_pending_delete(asset_id, video["id"])
             uploaded.append(asset_id)
+            names[asset_id] = frame.path.name
         if not uploaded:
             raise RuntimeError("no frame could be uploaded")
-        album_id = album.get()
-        if album_id:
-            try:
-                client.add_to_album(album_id, uploaded)
-            except ImmichError as e:
-                log.warning("  could not add frames to album: %s", e)
+        album_name = f"{cfg.album_prefix} {started:%Y-%m-%d %H:%M} {name}"
+        try:
+            album_id = client.create_album(
+                album_name, f"Temporary frames from {ALBUM_MARKER} for {name}. Deleted automatically.")
+            client.add_to_album(album_id, uploaded)
+        except ImmichError as e:
+            log.warning("  could not create album %r: %s", album_name, e)
 
-        log.info("  uploaded %d frame(s), waiting for Immich face recognition...", len(uploaded))
-        frame_faces = wait_for_faces(client, uploaded, cfg)
+        log.info("  uploaded %d frame(s) to album %r, waiting for Immich's background jobs...",
+                 len(uploaded), album_name)
+        frame_faces, finished = wait_for_faces(client, uploaded, cfg)
+        if not finished:
+            # Immich is still busy (e.g. a big backup): keep frames + album, the next run collects the result
+            log.warning("  Immich still busy after %ds: frames kept, results collected next run",
+                        cfg.face_wait_timeout)
+            state.record(video, "waiting", candidates=len(candidates), frames=len(uploaded))
+            keep_for_later = True
+            return True
+        empty = [fid for fid, faces in frame_faces.items() if not faces]
+        broken = failed_frames(client, empty) if empty else set()
+        if broken:
+            raise RuntimeError(f"Immich failed to process {len(broken)} frame(s), see Immich > Jobs; retried later")
         found = sum(len(f) for f in frame_faces.values())
         recognised = sum(1 for faces in frame_faces.values() for f in faces if f.get("person"))
+        for asset_id, faces in frame_faces.items():
+            log.info("    %s: %s", names[asset_id], describe_faces(faces))
         added = copy_people_to_video(client, video["id"], frame_faces)
-
-        log.info(
-            "  %d face(s) found, %d recognised, people added to video: %s",
-            found, recognised, ", ".join(added) if added else "none",
-        )
+        log.info("  %d face(s) found by Immich, %d recognised, people added to video: %s",
+                 found, recognised, ", ".join(added) if added else "none")
+        if debug_folder:
+            lines = [f"{name}  ({video['id']})", f"scanned {started:%Y-%m-%d %H:%M}", ""]
+            lines += [f"{names[a]}: Immich found {describe_faces(f)}" for a, f in frame_faces.items()]
+            lines += ["", f"people added to the video: {', '.join(added) or 'none'}"]
+            (debug_folder / "summary.txt").write_text("\n".join(lines) + "\n")
         state.record(video, "done", candidates=len(candidates), frames=len(uploaded), faces_found=found,
-                     people_added=len(added), people_names=added)
+                     faces_recognised=recognised, people_added=len(added), people_names=added)
         return True
     except Exception as e:
         log.error("  failed: %s", e)
@@ -745,40 +975,17 @@ def process_video(client: ImmichClient, state: State, cfg: Config, album: "Album
         return False
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        if cfg.keep_frames:
-            log.info("  keeping frames in Immich (keep_frames is on)")
-            state.clear_pending_deletes(uploaded)
-        else:
-            delete_frames(client, state, uploaded)
-
-
-class AlbumHolder:
-    """Creates the temporary album only when a frame actually needs it."""
-
-    def __init__(self, client: ImmichClient, name: str):
-        self.client, self.name, self.id = client, name, None
-
-    def get(self) -> Optional[str]:
-        if self.id is None:
+        if keep_for_later:
+            pass
+        elif cfg.keep_frames:
+            if uploaded:
+                log.info("  keeping the frames and album in Immich until the next run (keep frames is on)")
+        elif delete_frames(client, state, uploaded) and album_id:
             try:
-                self.id = self.client.find_or_create_album(self.name)
+                client.delete_album(album_id)
+                log.info("  deleted album")
             except ImmichError as e:
-                log.warning("Could not use album %r (frames will still be processed): %s", self.name, e)
-                self.id = ""
-        return self.id or None
-
-    def remove_if_done(self, state: State) -> None:
-        """Delete the temporary album once all its frames are gone."""
-        if state.pending_deletes():
-            log.warning("Keeping album %r: some frames still have to be deleted", self.name)
-            return
-        try:
-            album_id = self.id or self.client.find_album(self.name)
-            if album_id:
-                self.client.delete_album(album_id)
-                log.info("Deleted temporary album %r", self.name)
-        except ImmichError as e:
-            log.warning("Could not delete album %r: %s", self.name, e)
+                log.warning("  could not delete album (next run retries): %s", e)
 
 
 def compute_deadline(stop_after: Optional[dt.time], now: dt.datetime) -> Optional[dt.datetime]:
@@ -832,13 +1039,10 @@ def scan(cfg: Config, state: State, client: ImmichClient, args: argparse.Namespa
             print(f"{v['id']}  {v.get('fileCreatedAt', '')[:10]}  {v.get('originalFileName', '')}")
         return 0
 
-    album = AlbumHolder(client, cfg.album_name)
-    # Frames left behind by a previous run that crashed or lost the network.
-    delete_frames(client, state, state.pending_deletes())
+    cleanup_leftovers(client, state, cfg)
     if not batch:
         log.info("Nothing to do")
         state.set_meta("remaining", "0")
-        album.remove_if_done(state)
         return 0
 
     finder = load_face_finder(cfg)
@@ -848,12 +1052,10 @@ def scan(cfg: Config, state: State, client: ImmichClient, args: argparse.Namespa
         if deadline and dt.datetime.now() >= deadline:
             log.info("Reached STOP_AFTER %s, stopping", cfg.stop_after.strftime("%H:%M"))
             break
-        if not process_video(client, state, cfg, album, finder, video):
+        if not process_video(client, state, cfg, finder, video):
             failures += 1
     if not args.video_id:
         state.set_meta("remaining", str(len(pick_videos(todo, state, cfg.max_attempts))))
-    if not cfg.keep_frames:
-        album.remove_if_done(state)
     return 1 if failures else 0
 
 
@@ -894,6 +1096,7 @@ def build_report(state: State, since: str) -> str:
     runs = state.db.execute("SELECT * FROM runs WHERE started_at > ? ORDER BY id", (since,)).fetchall()
     done = [r for r in rows if r["status"] == "done"]
     failed = [r for r in rows if r["status"] == "failed"]
+    waiting = state.waiting_videos()
 
     lines = ["🎬 Immich video faces – nightly report", ""]
     if not runs:
@@ -907,6 +1110,7 @@ def build_report(state: State, since: str) -> str:
     checked = sum(r["candidates"] or 0 for r in done)
     uploaded = sum(r["frames"] or 0 for r in done)
     faces = sum(r["faces_found"] or 0 for r in done)
+    recognised = sum(r["faces_recognised"] or 0 for r in done)
     people = sum(r["people_added"] or 0 for r in done)
     with_faces = sum(1 for r in done if r["frames"])
     lines += [
@@ -914,7 +1118,7 @@ def build_report(state: State, since: str) -> str:
         f"Videos with faces: {with_faces}",
         f"Frames checked on the Pi: {checked}",
         f"Frames uploaded to Immich: {uploaded}",
-        f"Faces detected by Immich: {faces}",
+        f"Faces detected by Immich: {faces} ({recognised} recognised)",
         f"People added to videos: {people}",
     ]
     tagged = [r for r in done if r["people_names"]]
@@ -930,8 +1134,10 @@ def build_report(state: State, since: str) -> str:
             lines.append(f"✗ {r['file_name']}: {(r['last_error'] or '')[:120]}")
 
     lines.append("")
-    pending = len(state.pending_deletes())
-    lines.append("🧹 All temporary frames deleted." if not pending
+    if waiting:
+        lines.append(f"⏳ {len(waiting)} video(s) still being processed by Immich, finished next run.")
+    pending = len(state.pending_deletes(skip_videos=[r["asset_id"] for r in waiting]))
+    lines.append("🧹 All temporary frames and albums deleted." if not pending
                  else f"⚠️ {pending} frame(s) still in Immich, will be deleted next run.")
     remaining = state.get_meta("remaining")
     if remaining is not None:
@@ -978,7 +1184,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--status", action="store_true", help="show progress and exit")
     parser.add_argument("--report", action="store_true",
                         help="send the summary since the last report to Telegram (with --dry-run: print it)")
-    parser.add_argument("--keep-frames", action="store_true", help="don't delete frames from Immich (debugging)")
+    parser.add_argument("--keep-frames", action="store_true",
+                        help="leave frames and album in Immich until the next run, to inspect them")
+    parser.add_argument("--debug-dir", type=Path,
+                        help="save every checked frame (faces drawn on it) in a dated folder per video")
     parser.add_argument("--forget", metavar="VIDEO_ID", help="mark a video as not scanned")
     parser.add_argument("--retry-empty", action="store_true", help="rescan videos where no face was found")
     parser.add_argument("--retry-failed", action="store_true", help="rescan videos that failed too many times")
@@ -998,11 +1207,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         load_env_file(env_file)
     cfg = build_config(args)
 
-    if not args.report and not shutil.which("ffmpeg"):
-        raise SystemExit("ffmpeg not found (sudo apt install ffmpeg)")
-
     if args.report:  # read-only, may run while a scan is still going
         return run(cfg, args)
+    if not shutil.which("ffmpeg"):
+        raise SystemExit("ffmpeg not found (sudo apt install ffmpeg)")
     with single_instance(cfg.state_db.with_suffix(".lock")):
         return run(cfg, args)
 
