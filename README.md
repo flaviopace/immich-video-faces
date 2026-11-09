@@ -46,7 +46,7 @@ the results stop changing for 3 minutes, which is slower but still works.
 ## Install on the Raspberry Pi
 
 ```bash
-git clone https://github.com/<you>/immich-video-faces.git
+git clone https://github.com/flaviopace/immich-video-faces.git
 cd immich-video-faces
 ./install.sh
 nano ~/.config/immich-video-faces.env   # set IMMICH_URL and IMMICH_API_KEY
