@@ -106,7 +106,7 @@ nano ~/.config/immich-video-faces.env   # Immich URL + API key, Telegram token +
 
 `install.sh` installs `ffmpeg`, `python3-requests` and `python3-opencv`, and creates the config
 file. It also enables two systemd timers, both running as the user who ran the installer:
-the scan **every night at 01:00**, and the Telegram report **every morning at 08:00**.
+the scan **every night at 02:00** (after Immich's own midnight maintenance), and the Telegram report **every morning at 08:00**.
 
 Try it before the first night:
 
