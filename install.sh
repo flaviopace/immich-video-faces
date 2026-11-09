@@ -22,7 +22,7 @@ if [ ! -f "$CONFIG" ]; then
   echo "==> Created $CONFIG - edit IMMICH_URL, IMMICH_API_KEY and the Telegram settings"
 fi
 
-echo "==> Installing systemd timers (scan 02:30, Telegram report 08:00, as $RUN_USER)"
+echo "==> Installing systemd timers (scan 01:00, Telegram report 08:00, as $RUN_USER)"
 for unit in immich-video-faces immich-video-faces-report; do
   sed -e "s|__USER__|$RUN_USER|" -e "s|__DIR__|$DIR|" "$DIR/systemd/$unit.service" \
     | sudo tee "/etc/systemd/system/$unit.service" >/dev/null

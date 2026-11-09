@@ -2,8 +2,7 @@
 Description=Nightly Immich video face scan
 
 [Timer]
-OnCalendar=*-*-* 02:30:00
-RandomizedDelaySec=10min
+OnCalendar=*-*-* 01:00:00
 # Don't catch up on a missed run during the day
 Persistent=false
 
