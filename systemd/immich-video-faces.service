@@ -1,0 +1,13 @@
+[Unit]
+Description=Tag people in Immich videos
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+ExecStart=/usr/bin/python3 __DIR__/immich_video_faces.py
+# Be gentle with the Pi
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=5h

@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Immich video face scan
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=10min
+# Don't catch up on a missed run during the day
+Persistent=false
+
+[Install]
+WantedBy=timers.target
