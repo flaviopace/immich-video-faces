@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Blocks commits that contain API keys, tokens, private keys, config files or databases.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+fail=0
+files=$(git diff --cached --name-only --diff-filter=ACM)
+
+for f in $files; do
+  case "$f" in
+    *.env|*.db|*.sqlite|*.pem|*.key|id_rsa*|id_ed25519*)
+      [ "$f" = "config.example.env" ] && continue
+      echo "BLOCKED: $f looks like a config/secret/database file"; fail=1 ;;
+  esac
+done
+
+added=$(git diff --cached -U0 --diff-filter=ACM | grep -E '^\+[^+]' || true)
+patterns=(
+  'IMMICH_API_KEY *= *[A-Za-z0-9]{20,}'                         # a real Immich key
+  '(api[_-]?key|token|secret|passw(or)?d) *[=:] *["'"'"']?[A-Za-z0-9_\-]{24,}'
+  'gh[pousr]_[A-Za-z0-9]{20,}'                                  # GitHub tokens
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  '\b(192\.168|10\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]+\b'  # LAN addresses
+)
+for p in "${patterns[@]}"; do
+  if echo "$added" | grep -qiE -- "$p"; then
+    echo "BLOCKED: staged changes match a secret pattern: $p"
+    echo "$added" | grep -iE -- "$p" | head -3 | sed 's/^/    /'
+    fail=1
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "Commit aborted. Remove the sensitive data (keep keys in ~/.config/immich-video-faces.env)."
+  exit 1
+fi

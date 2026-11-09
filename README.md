@@ -85,7 +85,7 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 
 | Setting | Default | |
 |---|---|---|
-| `IMMICH_URL` | – | e.g. `http://192.168.1.10:2283` |
+| `IMMICH_URL` | – | e.g. `http://your-immich-server:2283` |
 | `IMMICH_API_KEY` | – | |
 | `MAX_VIDEOS` | `3` | videos per night |
 | `FRAMES_PER_VIDEO` | `8` | more frames = more people found, but slower |
