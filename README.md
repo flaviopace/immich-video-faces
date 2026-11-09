@@ -6,9 +6,10 @@ Immich only looks for faces in a video's **thumbnail**, so most people in a
 video are never recognised. This script runs at night on a Raspberry Pi and,
 for a few videos per night:
 
-1. grabs **one frame per second** with ffmpeg, streamed from Immich (a 30 s video takes about 5 s)
+1. grabs **one frame every 0.5 s** with ffmpeg, streamed from Immich (a 30 s video takes about 5 s)
 2. **checks every frame for faces on the Pi** (OpenCV, at full frame size, so small faces of 20 px count)
-   and keeps up to 6 frames with faces, spread across the video (the frames with the most faces win)
+   and keeps up to 30 frames with faces, spread across the video (frames with more and larger faces win).
+   Many moments matter: in testing, a child was recognised at 18.2 s but not at 18.0 s
 3. uploads only those frames to Immich as **archived** photos, in an album named with date, time and video,
    e.g. *Video faces 2026-11-09 23:10 20261108_180800.mp4*
 4. **waits until Immich has finished its background jobs for exactly those frames**
@@ -40,6 +41,19 @@ faces detected, people added (with names), failures, and how many videos are lef
 Each scanned video is recorded in a small SQLite database, so a video is never
 scanned twice, and new videos are picked up on the next night. New videos
 go first (newest first). Videos that failed are retried later, up to 3 times.
+
+## Your photos are safe
+
+The script only ever deletes what it created itself, and checks before every delete:
+
+* **Frames:** when a frame is uploaded, its name and SHA1 fingerprint are saved on the Pi. Before deleting,
+  the script asks Immich for the asset and deletes it only if it is a photo, owned by you, with **exactly
+  that name and content**. Anything else is refused, logged as an error and never retried. Videos are never deleted.
+* **Albums:** only albums the script created (their id is saved on the Pi), and only when they are **completely
+  empty**. An album you added your own photo to is kept. (Deleting an album in Immich never deletes the photos
+  in it anyway: it only removes the album.)
+* The script never edits or deletes your photos or videos; the only change it makes to your library is adding
+  people to videos.
 
 ## What gets tagged
 
@@ -120,13 +134,13 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | – | morning report; without them the report is only printed |
 | `MAX_VIDEOS` | `3` | videos per night |
 | `STOP_AFTER` | – | `HH:MM`; no new video is started after this time |
-| `CANDIDATE_INTERVAL` | `1` | seconds between frames checked on the Pi |
-| `CANDIDATE_MAX` | `90` | max frames checked per video (long videos get a wider interval) |
+| `CANDIDATE_INTERVAL` | `0.5` | seconds between frames checked on the Pi |
+| `CANDIDATE_MAX` | `120` | max frames checked per video (long videos get a wider interval) |
 | `ONE_PASS_MAX_SECONDS` | `180` | shorter videos are read in one fast pass, longer ones by seeking |
 | `FACE_FILTER` | `auto` | `auto` checks frames on the Pi; `off` uploads without checking |
 | `MIN_FACE_PX` | `20` | smaller faces are ignored |
 | `FACE_SCORE` | `0.9` | Pi detector confidence needed to count a face |
-| `FRAMES_PER_VIDEO` | `6` | max frames with faces uploaded per video |
+| `FRAMES_PER_VIDEO` | `30` | max frames with faces uploaded per video (~250 KB each, deleted after) |
 | `FRAME_MAX_SIZE` | `1440` | longest side of uploaded frames |
 | `ALBUM_PREFIX` | `Video faces` | per-video album: `<prefix> <date time> <video name>` |
 | `FACE_WAIT_TIMEOUT` | `900` | max seconds to wait for Immich per video (then: collected next run) |

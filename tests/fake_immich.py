@@ -4,6 +4,8 @@ Uploaded frames go through a simulated background job (face detection) that can 
 stuck, or failing, so the tests can check that the script waits for Immich properly."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import threading
@@ -41,6 +43,7 @@ class FakeImmich:
         self.albums: dict[str, dict] = {}  # id -> {"name", "description", "ids"}
         self.deleted_albums: list[str] = []
         self.video_faces: dict[str, list[dict]] = {}
+        self.library: dict[str, dict] = {}  # the user's own photos (must never be deleted)
         # background job simulation
         self.processing_delay = 0.0  # seconds before a frame's faces are ready
         self.stuck = False  # jobs never finish
@@ -93,6 +96,20 @@ class FakeImmich:
                     return False
                 return True
 
+            def _asset(self, aid):
+                if aid in fake.deleted:
+                    return None
+                if aid in fake.uploads:
+                    u = fake.uploads[aid]
+                    return {"id": aid, "type": "IMAGE", "originalFileName": u["name"], "checksum": u["checksum"],
+                            "ownerId": u.get("ownerId", OWNER), "visibility": "archive"}
+                return fake.videos.get(aid) or fake.library.get(aid)
+
+            def _album(self, album_id):
+                a = fake.albums[album_id]
+                count = sum(1 for i in a["ids"] if self._asset(i) is not None)
+                return {"id": album_id, "albumName": a["name"], "description": a["description"], "assetCount": count}
+
             def do_GET(self):
                 if not self._auth():
                     return
@@ -103,8 +120,12 @@ class FakeImmich:
                 if p == "/api/users/me":
                     return self._json(200, {"id": OWNER})
                 if p == "/api/albums":
-                    return self._json(200, [{"id": k, "albumName": a["name"], "description": a["description"],
-                                             "assetCount": len(a["ids"])} for k, a in fake.albums.items()])
+                    return self._json(200, [self._album(k) for k in fake.albums])
+                m = re.fullmatch(r"/api/albums/([^/]+)", p)
+                if m:
+                    if m.group(1) not in fake.albums:
+                        return self._json(400, {"message": "Not found or no album.read access"})
+                    return self._json(200, self._album(m.group(1)))
                 if p == "/api/jobs":
                     counts = {q: {"jobCounts": {"active": 0, "waiting": 0, "delayed": 0, "paused": 0}} for q in QUEUES}
                     counts["faceDetection"]["jobCounts"]["waiting"] = len(fake.pending_frames())
@@ -139,8 +160,11 @@ class FakeImmich:
                     self.wfile.write(data)
                     return
                 m = re.fullmatch(r"/api/assets/([^/]+)", p)
-                if m and m.group(1) in fake.videos:
-                    return self._json(200, fake.videos[m.group(1)])
+                if m:
+                    asset = self._asset(m.group(1))
+                    if asset is None:
+                        return self._json(400, {"message": "Not found or no asset.read access"})
+                    return self._json(200, asset)
                 self._json(404, {"message": "not found " + p})
 
             def do_POST(self):
@@ -157,8 +181,12 @@ class FakeImmich:
                     video = name.rsplit("_t", 1)[0]
                     index = sum(1 for u in fake.uploads.values() if u["name"].rsplit("_t", 1)[0] == video)
                     assert b'name="visibility"' in raw and b"archive" in raw
+                    boundary = self.headers["Content-Type"].split("boundary=")[1].encode()
+                    part = next(x for x in raw.split(b"--" + boundary) if b'name="assetData"' in x)
+                    content = part.split(b"\r\n\r\n", 1)[1][:-2]
                     aid = str(uuid.uuid4())
                     fake.uploads[aid] = {"name": name, "index": index, "size": len(raw),
+                                         "checksum": base64.b64encode(hashlib.sha1(content).digest()).decode(),
                                          "ready_at": time.monotonic() + fake.processing_delay}
                     return self._json(201, {"id": aid, "status": "created"})
                 if p == "/api/albums":

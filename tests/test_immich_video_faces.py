@@ -289,7 +289,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.fake.albums, {})  # album never even created
         row = self.state().get("vid-d")
         self.assertEqual(row["status"], "done")
-        self.assertGreaterEqual(row["candidates"], 9)  # one frame per second of the 10s video
+        self.assertGreaterEqual(row["candidates"], 19)  # one frame every 0.5s of the 10s video
         self.assertEqual(row["frames"], 0)
 
     def test_only_frames_with_faces_are_uploaded(self):
@@ -374,19 +374,57 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("UPLOADED_vid-d_t003.0s.jpg", files)
         self.assertIn("UPLOADED_vid-d_t007.0s.jpg", files)
         self.assertIn("vid-d_t005.0s.jpg", files)
+        self.assertIn("vid-d_t005.5s.jpg", files)
         summary = (folder / "summary.txt").read_text()
         self.assertIn("Alice", summary)
         self.assertIn("people added to the video: Alice, Bob", summary)
 
+    def add_user_photo(self, asset_id="user-photo", name="IMG_0001.jpg"):
+        self.fake.library[asset_id] = {"id": asset_id, "type": "IMAGE", "originalFileName": name,
+                                       "checksum": "dXNlciBwaG90bw==", "ownerId": "user-1"}
+
     def test_leftover_albums_cleaned_safely(self):
+        self.add_user_photo()
+        ours = "Temporary frames from immich-video-faces for old.mp4. Deleted automatically."
         self.fake.albums = {
-            "a1": {"name": "Video faces 2026-01-01 03:00 old.mp4", "description": "frames from immich-video-faces",
-                   "ids": []},
+            "a1": {"name": "Video faces 2026-01-01 03:00 old.mp4", "description": ours, "ids": []},
             "a2": {"name": "Video faces from my holiday", "description": "my own album", "ids": []},
-            "a3": {"name": "Holiday", "description": "mentions immich-video-faces", "ids": []},
+            "a3": {"name": "Holiday", "description": ours, "ids": []},
+            "a4": {"name": "Video faces 2026-01-01 03:05 old2.mp4", "description": ours, "ids": ["user-photo"]},
         }
         self.assertEqual(self.run_script("--max-videos", "0"), 0)
-        self.assertEqual(sorted(self.fake.albums), ["a2", "a3"])
+        # only the empty album made by the script is gone; a4 holds one of your photos
+        self.assertEqual(sorted(self.fake.albums), ["a2", "a3", "a4"])
+        self.assertNotIn("user-photo", self.fake.deleted)
+
+    def test_never_deletes_anything_but_its_own_frames(self):
+        self.add_user_photo()
+        self.add_user_photo("user-frame-lookalike", "holiday_t001.0s.jpg")
+        state = self.state()
+        # even if the list of frames to delete were wrong, these must survive
+        state.add_pending_delete("user-photo", "vid-x", "vid-x_t001.0s.jpg", "c29tZXRoaW5n")  # name differs
+        state.add_pending_delete("user-frame-lookalike", "vid-x", "holiday_t001.0s.jpg", "b3RoZXI=")  # content differs
+        state.add_pending_delete("vid-a", "vid-x")  # a video
+        state.add_pending_delete("user-photo-2", "vid-x")  # unknown id: treated as gone
+        self.add_user_photo("user-photo-3", "IMG_0003.jpg")
+        state.add_pending_delete("user-photo-3", "vid-x")  # old entry without fingerprint: name must look like a frame
+        self.assertEqual(self.run_script("--max-videos", "0"), 0)
+        self.assertEqual(self.fake.deleted, [])
+        self.assertEqual(self.state().pending_deletes(), [])  # refused entries are dropped, never retried
+
+    def test_changed_frame_and_album_with_your_photo_are_kept(self):
+        self.add_user_photo()
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1", "--keep-frames"), 0)
+        [(album_id, album)] = self.fake.albums.items()
+        frame_a, frame_b = album["ids"]
+        album["ids"].append("user-photo")  # you put one of your photos in the script's album
+        self.fake.uploads[frame_b]["checksum"] = "Y2hhbmdlZA=="  # this frame is not what was uploaded any more
+        with mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "0"), 0)
+        self.assertEqual(self.fake.deleted, [frame_a])  # only the verified frame
+        self.assertIn(album_id, self.fake.albums)  # album kept: it still holds photos
+        self.assertEqual(self.state().albums(), [])  # and the script stops managing it
 
     def test_report_to_telegram(self):
         self.assertEqual(self.run_script("--frames", "2", env="FACE_FILTER=off\n"), 0)

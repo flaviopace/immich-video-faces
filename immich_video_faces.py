@@ -17,11 +17,14 @@ only handles new videos. `--report` sends a summary of the last night to Telegra
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -43,8 +46,10 @@ HERE = Path(__file__).resolve().parent
 MODELS_DIR = HERE / "models"
 DEFAULT_ENV_FILE = Path.home() / ".config" / "immich-video-faces.env"
 DEFAULT_STATE_DB = Path.home() / ".local" / "share" / "immich-video-faces" / "state.db"
-# written in the description of every album we create, so leftovers can be found safely
-ALBUM_MARKER = "immich-video-faces"
+# Every album this script creates has a description starting with this text
+ALBUM_DESCRIPTION = "Temporary frames from immich-video-faces"
+# Name of every frame this script uploads, e.g. 20261108_180800_t010.0s.jpg
+FRAME_NAME_RE = re.compile(r".+_t\d{3,}\.\ds\.jpg")
 
 # Immich's chain of background jobs for an uploaded photo, in order. Face recognition comes last,
 # with one job per face (archived photos get a second, "deferred" recognition job).
@@ -63,10 +68,10 @@ class Config:
     api_key: str
     state_db: Path = DEFAULT_STATE_DB
     max_videos: int = 3
-    candidate_interval: float = 1.0  # seconds between frames checked on the Pi
-    candidate_max: int = 90  # cap per video (long videos get a wider interval)
+    candidate_interval: float = 0.5  # seconds between frames checked on the Pi
+    candidate_max: int = 120  # cap per video (long videos get a wider interval)
     one_pass_max_seconds: int = 180  # videos up to this length are read in one fast pass
-    frames_per_video: int = 6  # max frames uploaded to Immich per video
+    frames_per_video: int = 30  # max frames uploaded to Immich per video
     frame_max_size: int = 1440  # longest side; Immich analyses a 1440px preview anyway
     face_filter: str = "auto"  # auto: check frames with OpenCV if installed | off: upload without checking
     min_face_px: int = 20  # smaller faces are ignored
@@ -167,6 +172,7 @@ class ImmichClient:
         self.api_key = api_key
         self.timeout = timeout
         self.major_version = 0
+        self.user_id: Optional[str] = None
         self._can_read_queues = True
         self._can_list_jobs = True
         self.session = requests.Session()
@@ -189,7 +195,8 @@ class ImmichClient:
         return f"{v['major']}.{v['minor']}.{v['patch']}"
 
     def my_user_id(self) -> str:
-        return self._call("GET", "/users/me")["id"]
+        self.user_id = self._call("GET", "/users/me")["id"]
+        return self.user_id
 
     def get_asset(self, asset_id: str) -> dict:
         return self._call("GET", f"/assets/{asset_id}")
@@ -250,6 +257,9 @@ class ImmichClient:
 
     def create_album(self, name: str, description: str) -> str:
         return self._call("POST", "/albums", json={"albumName": name, "description": description})["id"]
+
+    def get_album(self, album_id: str) -> dict:
+        return self._call("GET", f"/albums/{album_id}")
 
     def delete_album(self, album_id: str) -> None:
         # removes the album only; assets in it are not touched
@@ -330,6 +340,13 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
     video_id   TEXT,
     created_at TEXT NOT NULL
 );
+-- albums created by this script (the only albums it may delete)
+CREATE TABLE IF NOT EXISTS albums (
+    album_id   TEXT PRIMARY KEY,
+    name       TEXT,
+    video_id   TEXT,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT NOT NULL,
@@ -347,6 +364,9 @@ MIGRATIONS = [
     ("videos", "candidates", "INTEGER"),  # frames checked on the Pi
     ("videos", "people_names", "TEXT"),
     ("videos", "faces_recognised", "INTEGER"),
+    # fingerprint of every uploaded frame: only a photo matching it is ever deleted
+    ("pending_deletes", "file_name", "TEXT"),
+    ("pending_deletes", "checksum", "TEXT"),
 ]
 
 
@@ -407,12 +427,29 @@ class State:
         with self.db:
             return self.db.execute("DELETE FROM videos WHERE status = 'failed'").rowcount
 
-    def add_pending_delete(self, asset_id: str, video_id: str) -> None:
+    def add_pending_delete(self, asset_id: str, video_id: str, file_name: Optional[str] = None,
+                           checksum: Optional[str] = None) -> None:
         with self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO pending_deletes (asset_id, video_id, created_at) VALUES (?, ?, ?)",
-                (asset_id, video_id, _now()),
+                "INSERT OR IGNORE INTO pending_deletes (asset_id, video_id, created_at, file_name, checksum)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (asset_id, video_id, _now(), file_name, checksum),
             )
+
+    def pending_info(self, asset_id: str) -> Optional[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM pending_deletes WHERE asset_id = ?", (asset_id,)).fetchone()
+
+    def add_album(self, album_id: str, name: Optional[str], video_id: Optional[str]) -> None:
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO albums (album_id, name, video_id, created_at) VALUES (?, ?, ?, ?)",
+                            (album_id, name, video_id, _now()))
+
+    def remove_album(self, album_id: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM albums WHERE album_id = ?", (album_id,))
+
+    def albums(self) -> List[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM albums").fetchall()
 
     def is_pending_delete(self, asset_id: str) -> bool:
         return self.db.execute("SELECT 1 FROM pending_deletes WHERE asset_id = ?", (asset_id,)).fetchone() is not None
@@ -668,7 +705,9 @@ def load_face_finder(cfg: Config) -> Optional[FaceFinder]:
 
 
 def select_frames(frames: List[Frame], limit: int) -> List[Frame]:
-    """Up to `limit` frames, spread over the video: the best frame from each time slice."""
+    """Up to `limit` frames, spread over the video: the best frame from each time slice
+    (most faces, then largest faces). Adjacent moments matter: a face recognised at 18.2s
+    can be missed at 18.0s, so with enough slots every frame with faces is uploaded."""
     if not frames:
         return []
     best: Dict[int, Frame] = {}
@@ -677,7 +716,7 @@ def select_frames(frames: List[Frame], limit: int) -> List[Frame]:
             continue
         slot = index * limit // len(frames)
         current = best.get(slot)
-        if current is None or (len(frame.faces), max(frame.faces)) > (len(current.faces), max(current.faces)):
+        if current is None or (len(frame.faces), sum(frame.faces)) > (len(current.faces), sum(current.faces)):
             best[slot] = frame
     return sorted(best.values(), key=lambda f: f.at)
 
@@ -823,17 +862,91 @@ def describe_faces(faces: List[dict]) -> str:
 # --------------------------------------------------------------------------- run
 
 
+def file_checksum(path: Path) -> str:
+    """Base64 SHA1 of a file, the same fingerprint Immich shows as an asset's checksum."""
+    digest = hashlib.sha1()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode()
+
+
+def is_script_frame(asset: dict, expected: Optional[sqlite3.Row], user_id: Optional[str]) -> Tuple[bool, str]:
+    """Is this Immich asset really a frame this script uploaded? Anything else must never be deleted."""
+    if asset.get("type") != "IMAGE":
+        return False, f"it is a {asset.get('type') or 'unknown asset'}, not a frame"
+    if user_id and asset.get("ownerId") and asset["ownerId"] != user_id:
+        return False, "it belongs to another user"
+    name = asset.get("originalFileName") or ""
+    if expected is not None and expected["file_name"]:
+        if name != expected["file_name"]:
+            return False, f"its name is not the name of the uploaded frame ({expected['file_name']})"
+    elif not FRAME_NAME_RE.fullmatch(name):
+        return False, "its name is not a frame name"
+    if expected is not None and expected["checksum"] and asset.get("checksum") != expected["checksum"]:
+        return False, "its content is not the content of the uploaded frame"
+    return True, ""
+
+
 def delete_frames(client: ImmichClient, state: State, ids: List[str]) -> bool:
+    """Delete frames this script uploaded. Returns True when none of them is left in Immich.
+
+    Safety: every asset is fetched first, and only a photo with the exact name and content (SHA1)
+    of a frame this script uploaded is deleted. Anything else is refused and never retried."""
     if not ids:
         return True
+    verified = []
     try:
-        client.delete_assets(ids)
-        state.clear_pending_deletes(ids)
-        log.info("  deleted %d frame(s) from Immich", len(ids))
+        for asset_id in ids:
+            try:
+                asset = client.get_asset(asset_id)
+            except ImmichError as e:
+                if e.status in (400, 404):  # already gone
+                    state.clear_pending_deletes([asset_id])
+                    continue
+                raise
+            ok, why = is_script_frame(asset, state.pending_info(asset_id), client.user_id)
+            if ok:
+                verified.append(asset_id)
+            else:
+                log.error("NOT deleting %s (%r): %s", asset_id, asset.get("originalFileName"), why)
+                state.clear_pending_deletes([asset_id])
+        if verified:
+            client.delete_assets(verified)
+            state.clear_pending_deletes(verified)
+            log.info("  deleted %d frame(s) from Immich", len(verified))
         return True
-    except Exception as e:  # keep going; next run retries
+    except Exception as e:  # network, Immich down...: next run retries
         log.warning("Could not delete %d frame(s), will retry next run: %s", len(ids), e)
         return False
+
+
+def delete_album_if_safe(client: ImmichClient, state: State, album_id: str) -> None:
+    """Delete an album this script created, and only when it holds no photo at all.
+
+    (Deleting an album in Immich never deletes the photos in it; this check also keeps any album
+    you added your own photos to.)"""
+    try:
+        album = client.get_album(album_id)
+    except ImmichError as e:
+        if e.status in (400, 404):  # already gone
+            state.remove_album(album_id)
+        else:
+            log.warning("Could not check album %s (next run retries): %s", album_id, e)
+        return
+    name = album.get("albumName")
+    count = album.get("assetCount")
+    if count is None or count > 0:
+        if count and not state.pending_deletes():
+            log.warning("Keeping album %r: it contains %s photo(s) not made by this script", name, count)
+            state.remove_album(album_id)  # not ours to manage any more
+        return
+    try:
+        client.delete_album(album_id)
+        state.remove_album(album_id)
+        log.info("  deleted album %r", name)
+    except ImmichError as e:
+        log.warning("Could not delete album %r (next run retries): %s", name, e)
 
 
 def harvest_waiting(client: ImmichClient, state: State, cfg: Config) -> Set[str]:
@@ -870,16 +983,16 @@ def cleanup_leftovers(client: ImmichClient, state: State, cfg: Config) -> None:
     """Finish or delete what an earlier run left behind (Immich busy, crash, network loss, --keep-frames)."""
     still_waiting = harvest_waiting(client, state, cfg)
     delete_frames(client, state, state.pending_deletes(skip_videos=still_waiting))
-    if state.pending_deletes():
-        return  # some frames are still in Immich: keep the albums too
+    # albums made before albums were recorded: adopt them only if they carry our exact description
+    known = {r["album_id"] for r in state.albums()}
     for album in client.list_albums():
-        name = album.get("albumName") or ""
-        if name.startswith(cfg.album_prefix) and ALBUM_MARKER in (album.get("description") or ""):
-            try:
-                client.delete_album(album["id"])
-                log.info("Deleted leftover album %r", name)
-            except ImmichError as e:
-                log.warning("Could not delete album %r: %s", name, e)
+        if (album["id"] not in known and (album.get("albumName") or "").startswith(cfg.album_prefix)
+                and (album.get("description") or "").startswith(ALBUM_DESCRIPTION)):
+            state.add_album(album["id"], album.get("albumName"), None)
+    for row in state.albums():
+        if row["video_id"] in still_waiting or (row["video_id"] and state.pending_deletes(row["video_id"])):
+            continue  # its frames are still needed or not deleted yet
+        delete_album_if_safe(client, state, row["album_id"])
 
 
 def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optional[FaceFinder],
@@ -926,15 +1039,15 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
                 # Same file already in Immich and not uploaded by us: leave it alone.
                 log.warning("  %s already exists in Immich as %s, skipping it", frame.path.name, asset_id)
                 continue
-            state.add_pending_delete(asset_id, video["id"])
+            state.add_pending_delete(asset_id, video["id"], frame.path.name, file_checksum(frame.path))
             uploaded.append(asset_id)
             names[asset_id] = frame.path.name
         if not uploaded:
             raise RuntimeError("no frame could be uploaded")
         album_name = f"{cfg.album_prefix} {started:%Y-%m-%d %H:%M} {name}"
         try:
-            album_id = client.create_album(
-                album_name, f"Temporary frames from {ALBUM_MARKER} for {name}. Deleted automatically.")
+            album_id = client.create_album(album_name, f"{ALBUM_DESCRIPTION} for {name}. Deleted automatically.")
+            state.add_album(album_id, album_name, video["id"])
             client.add_to_album(album_id, uploaded)
         except ImmichError as e:
             log.warning("  could not create album %r: %s", album_name, e)
@@ -981,11 +1094,7 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
             if uploaded:
                 log.info("  keeping the frames and album in Immich until the next run (keep frames is on)")
         elif delete_frames(client, state, uploaded) and album_id:
-            try:
-                client.delete_album(album_id)
-                log.info("  deleted album")
-            except ImmichError as e:
-                log.warning("  could not delete album (next run retries): %s", e)
+            delete_album_if_safe(client, state, album_id)
 
 
 def compute_deadline(stop_after: Optional[dt.time], now: dt.datetime) -> Optional[dt.datetime]:
@@ -1178,7 +1287,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Tag people in Immich videos using sampled frames.")
     parser.add_argument("--env-file", type=Path, help=f"config file (default: {DEFAULT_ENV_FILE} if present)")
     parser.add_argument("--max-videos", type=int, help="videos to scan this run (default 3)")
-    parser.add_argument("--frames", type=int, help="max frames uploaded per video (default 6)")
+    parser.add_argument("--frames", type=int, help="max frames uploaded per video (default 30)")
     parser.add_argument("--video-id", help="scan this one video now, even if already scanned")
     parser.add_argument("--dry-run", action="store_true", help="only list the videos the next run would scan")
     parser.add_argument("--status", action="store_true", help="show progress and exit")
