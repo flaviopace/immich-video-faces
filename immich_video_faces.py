@@ -71,7 +71,7 @@ class Config:
     candidate_interval: float = 0.5  # seconds between frames checked on the Pi
     candidate_max: int = 120  # cap per video (long videos get a wider interval)
     one_pass_max_seconds: int = 180  # videos up to this length are read in one fast pass
-    frames_per_video: int = 30  # max frames uploaded to Immich per video
+    frames_per_video: int = 60  # max frames uploaded to Immich per video
     frame_max_size: int = 1440  # longest side; Immich analyses a 1440px preview anyway
     face_filter: str = "auto"  # auto: check frames with OpenCV if installed | off: upload without checking
     min_face_px: int = 20  # smaller faces are ignored
@@ -1019,7 +1019,7 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
             chosen = select_frames(candidates, cfg.frames_per_video)
             log.info("  checked %d frame(s) on the Pi in %.0fs, %d with faces, uploading %d: %s",
                      len(candidates), time.monotonic() - t0, sum(1 for f in candidates if f.faces), len(chosen),
-                     ", ".join(f"{f.at:.0f}s ({len(f.faces)} faces)" for f in chosen) or "-")
+                     ", ".join(f"{f.at:g}s ({len(f.faces)})" for f in chosen) or "-")
         else:
             chosen = candidates
         if debug_folder:
@@ -1287,7 +1287,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Tag people in Immich videos using sampled frames.")
     parser.add_argument("--env-file", type=Path, help=f"config file (default: {DEFAULT_ENV_FILE} if present)")
     parser.add_argument("--max-videos", type=int, help="videos to scan this run (default 3)")
-    parser.add_argument("--frames", type=int, help="max frames uploaded per video (default 30)")
+    parser.add_argument("--frames", type=int, help="max frames uploaded per video (default 60)")
     parser.add_argument("--video-id", help="scan this one video now, even if already scanned")
     parser.add_argument("--dry-run", action="store_true", help="only list the videos the next run would scan")
     parser.add_argument("--status", action="store_true", help="show progress and exit")

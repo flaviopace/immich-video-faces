@@ -8,7 +8,7 @@ for a few videos per night:
 
 1. grabs **one frame every 0.5 s** with ffmpeg, streamed from Immich (a 30 s video takes about 5 s)
 2. **checks every frame for faces on the Pi** (OpenCV, at full frame size, so small faces of 20 px count)
-   and keeps up to 30 frames with faces, spread across the video (frames with more and larger faces win).
+   and keeps up to 60 frames with faces, spread across the video (frames with more and larger faces win).
    Many moments matter: in testing, a child was recognised at 18.2 s but not at 18.0 s
 3. uploads only those frames to Immich as **archived** photos, in an album named with date, time and video,
    e.g. *Video faces 2026-11-09 23:10 20261108_180800.mp4*
@@ -140,7 +140,7 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 | `FACE_FILTER` | `auto` | `auto` checks frames on the Pi; `off` uploads without checking |
 | `MIN_FACE_PX` | `20` | smaller faces are ignored |
 | `FACE_SCORE` | `0.9` | Pi detector confidence needed to count a face |
-| `FRAMES_PER_VIDEO` | `30` | max frames with faces uploaded per video (~250 KB each, deleted after) |
+| `FRAMES_PER_VIDEO` | `60` | max frames with faces uploaded per video (~250 KB each, deleted after) |
 | `FRAME_MAX_SIZE` | `1440` | longest side of uploaded frames |
 | `ALBUM_PREFIX` | `Video faces` | per-video album: `<prefix> <date time> <video name>` |
 | `FACE_WAIT_TIMEOUT` | `900` | max seconds to wait for Immich per video (then: collected next run) |
