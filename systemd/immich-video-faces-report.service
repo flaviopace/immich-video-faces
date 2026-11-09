@@ -1,0 +1,9 @@
+[Unit]
+Description=Send the Immich video faces report to Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+ExecStart=/usr/bin/python3 __DIR__/immich_video_faces.py --report

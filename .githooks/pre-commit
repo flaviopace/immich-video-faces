@@ -19,6 +19,7 @@ patterns=(
   'IMMICH_API_KEY *= *[A-Za-z0-9]{20,}'                         # a real Immich key
   '(api[_-]?key|token|secret|passw(or)?d) *[=:] *["'"'"']?[A-Za-z0-9_\-]{24,}'
   'gh[pousr]_[A-Za-z0-9]{20,}'                                  # GitHub tokens
+  '[0-9]{8,10}:[A-Za-z0-9_-]{35}'                               # Telegram bot tokens
   '-----BEGIN [A-Z ]*PRIVATE KEY-----'
   '\b(192\.168|10\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]+\b'  # LAN addresses
 )

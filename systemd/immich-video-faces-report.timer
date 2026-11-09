@@ -1,0 +1,8 @@
+[Unit]
+Description=Morning Telegram report for the Immich video face scan
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+
+[Install]
+WantedBy=timers.target

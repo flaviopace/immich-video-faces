@@ -15,32 +15,33 @@ OWNER = "user-1"
 
 class FakeImmich:
     def __init__(self, videos: dict[str, Path]):
-        self.videos = {
-            vid: {
+        self.videos = {}
+        for i, (vid, path) in enumerate(videos.items()):
+            self.videos[vid] = {
                 "id": vid,
                 "type": "VIDEO",
                 "ownerId": OWNER,
                 "originalFileName": path.name,
                 "fileCreatedAt": f"2024-01-0{i + 1}T10:00:00.000Z",
-                "duration": "0:00:10.000000",
+                # Immich v3 sends milliseconds, older versions send text
+                "duration": 10000 if i % 2 == 0 else "0:00:10.000000",
                 "visibility": "timeline",
                 "checksum": vid,
             }
-            for i, (vid, path) in enumerate(videos.items())
-        }
         self.files = videos
         self.uploads: dict[str, dict] = {}  # frame asset id -> form info
         self.deleted: list[str] = []
         self.created_faces: list[dict] = []
         self.albums: dict[str, dict] = {}  # id -> {"name", "ids"}
-        # frames recognise "Alice" in every frame, and "Bob" (bigger) in the 2nd one
+        self.deleted_albums: list[str] = []
         self.video_faces: dict[str, list[dict]] = {}
 
     def faces_for_frame(self, index: int) -> list[dict]:
+        # every frame shows Alice; frame 1 also shows Bob (big); plus an unknown face
         faces = [_face("p-alice", "Alice", 10, 10, 60, 60)]
         if index == 1:
             faces.append(_face("p-bob", "Bob", 100, 100, 300, 300))
-        faces.append(_face(None, None, 0, 0, 5, 5))  # unknown person
+        faces.append(_face(None, None, 0, 0, 5, 5))
         return faces
 
     def start(self):
@@ -74,7 +75,7 @@ class FakeImmich:
                 url = urlparse(self.path)
                 p = url.path
                 if p == "/api/server/version":
-                    return self._json(200, {"major": 2, "minor": 3, "patch": 1})
+                    return self._json(200, {"major": 3, "minor": 3, "patch": 6})
                 if p == "/api/users/me":
                     return self._json(200, {"id": OWNER})
                 if p == "/api/albums":
@@ -112,7 +113,8 @@ class FakeImmich:
                     return self._json(200, {"assets": {"items": items, "nextPage": None}, "albums": {}})
                 if p == "/api/assets":
                     name = re.search(rb'filename="([^"]+)"', raw).group(1).decode()
-                    index = int(re.search(r"frame(\d+)", name).group(1))
+                    video = name.split("_frame")[0]
+                    index = sum(1 for u in fake.uploads.values() if u["name"].split("_frame")[0] == video)
                     assert b'name="visibility"' in raw and b"archive" in raw
                     aid = str(uuid.uuid4())
                     fake.uploads[aid] = {"name": name, "index": index, "size": len(raw)}
@@ -141,9 +143,17 @@ class FakeImmich:
             def do_DELETE(self):
                 if not self._auth():
                     return
+                p = urlparse(self.path).path
+                m = re.fullmatch(r"/api/albums/([^/]+)", p)
+                if m:
+                    album = fake.albums.pop(m.group(1))
+                    fake.deleted_albums.append(album["name"])
+                    return self._json(204)
                 body = json.loads(self._body())
                 assert body["force"] is True
                 fake.deleted.extend(body["ids"])
+                for album in fake.albums.values():
+                    album["ids"] = [i for i in album["ids"] if i not in body["ids"]]
                 return self._json(204)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
