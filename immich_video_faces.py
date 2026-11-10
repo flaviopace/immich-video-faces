@@ -1223,9 +1223,9 @@ def build_report(state: State, since: str) -> str:
             lines.append(f"⚠️ La scansione delle {r['started_at'][11:16]} si è fermata con un errore: {r['error']}")
         elif not r["finished_at"]:
             lines.append(f"⚠️ La scansione delle {r['started_at'][11:16]} non è terminata.")
-    if runs and runs[0]["finished_at"]:
+    if runs and runs[0]["finished_at"]:  # the nightly scan is the first run since the last report
         start = dt.datetime.fromisoformat(runs[0]["started_at"])
-        end = dt.datetime.fromisoformat(runs[-1]["finished_at"] or runs[0]["finished_at"])
+        end = dt.datetime.fromisoformat(runs[0]["finished_at"])
         lines.append(f"🕑 {start:%H:%M} → {end:%H:%M} ({round((end - start).total_seconds() / 60)} min)")
 
     checked = sum(r["candidates"] or 0 for r in done)
