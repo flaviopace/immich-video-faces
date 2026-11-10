@@ -57,6 +57,8 @@ PIPELINE_QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration", 
                    "faceDetection")
 RECOGNITION_QUEUE = "facialRecognition"
 PENDING = ("active", "waiting", "delayed", "paused")
+ALBUM_DELETE_TRIES = 4
+ALBUM_DELETE_PAUSE = 5.0  # seconds, grows with each try
 
 
 # --------------------------------------------------------------------------- config
@@ -941,12 +943,18 @@ def delete_album_if_safe(client: ImmichClient, state: State, album_id: str) -> N
             log.warning("Keeping album %r: it contains %s photo(s) not made by this script", name, count)
             state.remove_album(album_id)  # not ours to manage any more
         return
-    try:
-        client.delete_album(album_id)
-        state.remove_album(album_id)
-        log.info("  deleted album %r", name)
-    except ImmichError as e:
-        log.warning("Could not delete album %r (next run retries): %s", name, e)
+    # Immich can answer HTTP 500 while it is still removing the frames just deleted: retry a few times
+    for attempt in range(ALBUM_DELETE_TRIES):
+        try:
+            client.delete_album(album_id)
+            state.remove_album(album_id)
+            log.info("  deleted album %r", name)
+            return
+        except ImmichError as e:
+            if e.status < 500 or attempt == ALBUM_DELETE_TRIES - 1:
+                log.warning("Could not delete album %r (next run retries): %s", name, e)
+                return
+            time.sleep(ALBUM_DELETE_PAUSE * (attempt + 1))
 
 
 def harvest_waiting(client: ImmichClient, state: State, cfg: Config) -> Set[str]:
@@ -1151,7 +1159,7 @@ def scan(cfg: Config, state: State, client: ImmichClient, args: argparse.Namespa
     cleanup_leftovers(client, state, cfg)
     if not batch:
         log.info("Nothing to do")
-        state.set_meta("remaining", "0")
+        state.set_meta("remaining", str(len(todo)))
         return 0
 
     finder = load_face_finder(cfg)
@@ -1207,36 +1215,54 @@ def build_report(state: State, since: str) -> str:
     failed = [r for r in rows if r["status"] == "failed"]
     waiting = state.waiting_videos()
 
-    lines = ["🎬 Immich video faces – nightly report", ""]
+    lines = ["🎬 Immich – volti nei video, riepilogo della notte", ""]
     if not runs:
-        lines.append("⚠️ The scan did not run since the last report.")
+        lines.append("⚠️ La scansione non è partita dall'ultimo riepilogo.")
     for r in runs:
         if r["error"]:
-            lines.append(f"⚠️ Run at {r['started_at'][11:16]} stopped with an error: {r['error']}")
+            lines.append(f"⚠️ La scansione delle {r['started_at'][11:16]} si è fermata con un errore: {r['error']}")
         elif not r["finished_at"]:
-            lines.append(f"⚠️ Run at {r['started_at'][11:16]} did not finish.")
+            lines.append(f"⚠️ La scansione delle {r['started_at'][11:16]} non è terminata.")
+    if runs and runs[0]["finished_at"]:
+        start = dt.datetime.fromisoformat(runs[0]["started_at"])
+        end = dt.datetime.fromisoformat(runs[-1]["finished_at"] or runs[0]["finished_at"])
+        lines.append(f"🕑 {start:%H:%M} → {end:%H:%M} ({round((end - start).total_seconds() / 60)} min)")
 
     checked = sum(r["candidates"] or 0 for r in done)
     uploaded = sum(r["frames"] or 0 for r in done)
     faces = sum(r["faces_found"] or 0 for r in done)
     recognised = sum(r["faces_recognised"] or 0 for r in done)
-    people = sum(r["people_added"] or 0 for r in done)
     with_faces = sum(1 for r in done if r["frames"])
+    with_people = [r for r in done if r["people_names"]]
     lines += [
-        f"Videos processed: {len(done)}" + (f" (+{len(failed)} failed)" if failed else ""),
-        f"Videos with faces: {with_faces}",
-        f"Frames checked on the Pi: {checked}",
-        f"Frames uploaded to Immich: {uploaded}",
-        f"Faces detected by Immich: {faces} ({recognised} recognised)",
-        f"People added to videos: {people}",
+        f"Video analizzati: {len(done)}" + (f" (+{len(failed)} con errore)" if failed else ""),
+        f"Video con volti: {with_faces}",
+        f"Video a cui sono state aggiunte persone: {len(with_people)}",
+        f"Fotogrammi controllati sul Pi: {checked}, caricati su Immich: {uploaded}",
+        f"Volti trovati da Immich: {faces} ({recognised} riconosciuti)",
     ]
-    tagged = [r for r in done if r["people_names"]]
-    if tagged:
-        lines.append("")
-        for r in tagged[:15]:
-            lines.append(f"• {r['file_name']}: {r['people_names']}")
-        if len(tagged) > 15:
-            lines.append(f"• … and {len(tagged) - 15} more")
+
+    per_person: Dict[str, int] = {}
+    unnamed = 0
+    for r in with_people:
+        for person in {n.strip() for n in r["people_names"].split(",")}:
+            if person == "unnamed":
+                unnamed += 1
+            else:
+                per_person[person] = per_person.get(person, 0) + 1
+    if per_person or unnamed:
+        lines += ["", "👤 Persone aggiunte ai video:"]
+        for person, count in sorted(per_person.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"• {person}: in {count} video")
+        if unnamed:
+            lines.append(f"• persone senza nome in Immich: in {unnamed} video")
+    if with_people:
+        lines += ["", "🎞 Dettaglio:"]
+        for r in with_people[:15]:
+            names = r["people_names"].replace("unnamed", "senza nome")
+            lines.append(f"• {r['file_name']}: {names}")
+        if len(with_people) > 15:
+            lines.append(f"• … e altri {len(with_people) - 15}")
     if failed:
         lines.append("")
         for r in failed[:5]:
@@ -1244,13 +1270,19 @@ def build_report(state: State, since: str) -> str:
 
     lines.append("")
     if waiting:
-        lines.append(f"⏳ {len(waiting)} video(s) still being processed by Immich, finished next run.")
+        lines.append(f"⏳ {len(waiting)} video ancora in elaborazione su Immich, completati la prossima notte.")
     pending = len(state.pending_deletes(skip_videos=[r["asset_id"] for r in waiting]))
-    lines.append("🧹 All temporary frames and albums deleted." if not pending
-                 else f"⚠️ {pending} frame(s) still in Immich, will be deleted next run.")
+    albums = len([a for a in state.albums() if a["video_id"] not in {r["asset_id"] for r in waiting}])
+    if not pending and not albums:
+        lines.append("🧹 Tutti i fotogrammi e gli album temporanei sono stati cancellati.")
+    else:
+        if pending:
+            lines.append(f"⚠️ {pending} fotogrammi ancora su Immich, verranno cancellati alla prossima scansione.")
+        if albums:
+            lines.append(f"⚠️ {albums} album temporanei ancora su Immich, verranno cancellati alla prossima scansione.")
     remaining = state.get_meta("remaining")
     if remaining is not None:
-        lines.append(f"Videos left to scan: {remaining}")
+        lines.append(f"Video ancora da analizzare: {remaining}")
     return "\n".join(lines)
 
 

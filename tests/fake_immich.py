@@ -44,6 +44,7 @@ class FakeImmich:
         self.deleted_albums: list[str] = []
         self.video_faces: dict[str, list[dict]] = {}
         self.library: dict[str, dict] = {}  # the user's own photos (must never be deleted)
+        self.album_delete_failures = 0  # next N album deletes answer HTTP 500
         # background job simulation
         self.processing_delay = 0.0  # seconds before a frame's faces are ready
         self.stuck = False  # jobs never finish
@@ -217,6 +218,9 @@ class FakeImmich:
                 p = urlparse(self.path).path
                 m = re.fullmatch(r"/api/albums/([^/]+)", p)
                 if m:
+                    if fake.album_delete_failures > 0:
+                        fake.album_delete_failures -= 1
+                        return self._json(500, {"message": "Failed to delete album"})
                     album = fake.albums.pop(m.group(1))
                     fake.deleted_albums.append(album["name"])
                     return self._json(204)

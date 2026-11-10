@@ -160,7 +160,7 @@ class StateTests(unittest.TestCase):
 
     def test_report(self):
         since = "2000-01-01T00:00:00"
-        self.assertIn("did not run", ivf.build_report(self.state, since))
+        self.assertIn("non è partita", ivf.build_report(self.state, since))
 
         run = self.state.start_run()
         self.state.record({"id": "a", "originalFileName": "a.mp4"}, "done", candidates=29, frames=3,
@@ -171,20 +171,21 @@ class StateTests(unittest.TestCase):
         self.state.finish_run(run)
         self.state.set_meta("remaining", "42")
         text = ivf.build_report(self.state, since)
-        for expected in ("Videos processed: 2 (+1 failed)", "Videos with faces: 1", "Frames checked on the Pi: 48",
-                         "Frames uploaded to Immich: 3", "Faces detected by Immich: 5 (4 recognised)",
-                         "People added to videos: 2", "a.mp4: Alice, Bob", "c.mp4: boom",
-                         "All temporary frames and albums deleted", "Videos left to scan: 42"):
+        for expected in ("Video analizzati: 2 (+1 con errore)", "Video con volti: 1",
+                         "Fotogrammi controllati sul Pi: 48, caricati su Immich: 3",
+                         "Volti trovati da Immich: 5 (4 riconosciuti)", "• Alice: in 1 video", "• Bob: in 1 video",
+                         "a.mp4: Alice, Bob", "c.mp4: boom",
+                         "Tutti i fotogrammi e gli album temporanei sono stati cancellati", "Video ancora da analizzare: 42"):
             self.assertIn(expected, text)
-        self.assertNotIn("did not run", text)
+        self.assertNotIn("non è partita", text)
 
         self.state.add_pending_delete("f1", "a")
-        self.assertIn("1 frame(s) still in Immich", ivf.build_report(self.state, since))
+        self.assertIn("1 fotogrammi ancora su Immich", ivf.build_report(self.state, since))
         self.state.record({"id": "d", "originalFileName": "d.mp4"}, "waiting")
         self.state.add_pending_delete("f2", "d")
         text = ivf.build_report(self.state, since)
-        self.assertIn("1 video(s) still being processed by Immich", text)
-        self.assertIn("1 frame(s) still in Immich", text)  # frames of the waiting video are not "leftovers"
+        self.assertIn("1 video ancora in elaborazione", text)
+        self.assertIn("1 fotogrammi ancora su Immich", text)  # frames of the waiting video are not "leftovers"
 
 
 class FakeFinder:
@@ -330,7 +331,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(len(self.fake.albums), 2)
         self.assertEqual({r["asset_id"] for r in self.state().waiting_videos()}, {"vid-c", "vid-d"})
         report = ivf.build_report(self.state(), "2000-01-01T00:00:00")
-        self.assertIn("2 video(s) still being processed by Immich", report)
+        self.assertIn("2 video ancora in elaborazione", report)
 
         # Immich catches up; the next run collects the results first, then cleans up
         self.fake.stuck = False
@@ -434,12 +435,32 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             token, chat, text = sent[0]
             self.assertEqual((token, chat), ("123:abc", "42"))
-            self.assertIn("Videos processed: 3", text)
-            self.assertIn("Videos left to scan: 1", text)
-            self.assertIn("All temporary frames and albums deleted", text)
+            self.assertIn("Video analizzati: 3", text)
+            self.assertIn("Video ancora da analizzare: 1", text)
+            self.assertIn("Tutti i fotogrammi e gli album temporanei sono stati cancellati", text)
             # next report only covers what happened after this one
             self.run_script("--report", env="TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID=42\n")
-            self.assertIn("did not run", sent[1][2])
+            self.assertIn("non è partita", sent[1][2])
+
+    def test_album_delete_retried_after_immich_error(self):
+        self.fake.album_delete_failures = 2  # Immich answers 500 twice, then succeeds
+        with mock.patch.object(ivf, "ALBUM_DELETE_PAUSE", 0.01), \
+                mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        self.assert_cleaned_up()
+        self.assertEqual(self.state().albums(), [])
+
+    def test_report_counts_leftover_albums(self):
+        self.fake.album_delete_failures = 99
+        with mock.patch.object(ivf, "ALBUM_DELETE_PAUSE", 0.01), \
+                mock.patch.object(ivf, "load_face_finder", return_value=FakeFinder()):
+            self.assertEqual(self.run_script("--max-videos", "1"), 0)
+        report = ivf.build_report(self.state(), "2000-01-01T00:00:00")
+        self.assertIn("1 album temporanei ancora su Immich", report)
+        self.assertNotIn("Tutti i fotogrammi", report)
+        self.fake.album_delete_failures = 0  # next run cleans it up
+        self.assertEqual(self.run_script("--max-videos", "0"), 0)
+        self.assertEqual(self.fake.albums, {})
 
     def test_dry_run_changes_nothing(self):
         self.assertEqual(self.run_script("--dry-run"), 0)
