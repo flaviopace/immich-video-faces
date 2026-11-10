@@ -164,16 +164,18 @@ class StateTests(unittest.TestCase):
 
         run = self.state.start_run()
         self.state.record({"id": "a", "originalFileName": "a.mp4"}, "done", candidates=29, frames=3,
-                          faces_found=5, faces_recognised=4, people_added=2, people_names=["Alice", "Bob"])
+                          faces_found=5, faces_recognised=4, people_added=2, people_names=["Alice", "Bob"],
+                          people_present=["Alice", "Bob"])
         self.state.record({"id": "b", "originalFileName": "b.mp4"}, "done", candidates=19, frames=0,
-                          faces_found=0, people_added=0)
+                          faces_found=0, people_added=0, people_present=["Alice"])
         self.state.record({"id": "c", "originalFileName": "c.mp4"}, "failed", error="boom")
         self.state.finish_run(run)
         self.state.set_meta("remaining", "42")
         text = ivf.build_report(self.state, since)
         for expected in ("Video analizzati: 2 (+1 con errore)", "Video con volti: 1",
                          "Fotogrammi controllati sul Pi: 48, caricati su Immich: 3",
-                         "Volti trovati da Immich: 5 (4 riconosciuti)", "• Alice: in 1 video", "• Bob: in 1 video",
+                         "Volti trovati da Immich: 5 (4 riconosciuti)",
+                         "• Alice: in 2 video (aggiunto stanotte in 1)", "• Bob: in 1 video (aggiunto stanotte in 1)",
                          "a.mp4: Alice, Bob", "c.mp4: boom",
                          "Tutti i fotogrammi e gli album temporanei sono stati cancellati", "Video ancora da analizzare: 42"):
             self.assertIn(expected, text)
@@ -272,6 +274,7 @@ class EndToEndTests(unittest.TestCase):
         self.fake.created_faces.clear()
         self.assertEqual(self.run_script("--frames", "4", env="FACE_FILTER=off\n"), 0)
         self.assertEqual([(f["assetId"], f["personId"]) for f in self.fake.created_faces], [("vid-a", "p-bob")])
+        self.assertEqual(self.state().get("vid-a")["people_present"], "Alice")  # fake doesn't store created faces
         self.assert_cleaned_up()
 
         # third run: nothing left

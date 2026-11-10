@@ -369,6 +369,7 @@ MIGRATIONS = [
     # fingerprint of every uploaded frame: only a photo matching it is ever deleted
     ("pending_deletes", "file_name", "TEXT"),
     ("pending_deletes", "checksum", "TEXT"),
+    ("videos", "people_present", "TEXT"),  # everyone on the video after the scan (incl. found by Immich itself)
 ]
 
 
@@ -398,8 +399,8 @@ class State:
             self.db.execute(
                 """INSERT OR REPLACE INTO videos
                    (asset_id, file_name, checksum, status, attempts, candidates, frames, faces_found,
-                    faces_recognised, people_added, people_names, last_error, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    faces_recognised, people_added, people_names, people_present, last_error, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     video["id"],
                     video.get("originalFileName"),
@@ -412,6 +413,7 @@ class State:
                     stats.get("faces_recognised"),
                     stats.get("people_added"),
                     ", ".join(stats.get("people_names") or []) or None,
+                    ", ".join(stats.get("people_present") or []) or None,
                     error,
                     _now(),
                 ),
@@ -853,6 +855,16 @@ def copy_people_to_video(client: ImmichClient, video_id: str, frame_faces: Dict[
     return added
 
 
+def people_on(client: ImmichClient, video_id: str) -> List[str]:
+    """Names of everyone on the video now ("unnamed" once per person without a name)."""
+    names = {}
+    for face in client.get_faces(video_id):
+        person = face.get("person")
+        if person:
+            names[person["id"]] = person.get("name") or "unnamed"
+    return sorted(names.values())
+
+
 def describe_faces(faces: List[dict]) -> str:
     if not faces:
         return "no face"
@@ -983,7 +995,8 @@ def harvest_waiting(client: ImmichClient, state: State, cfg: Config) -> Set[str]
         log.info("Collected %s from an earlier run: %d face(s), %d recognised, people added: %s",
                  row["file_name"], found, recognised, ", ".join(added) or "none")
         state.record(video, "done", candidates=row["candidates"], frames=len(frame_ids), faces_found=found,
-                     faces_recognised=recognised, people_added=len(added), people_names=added)
+                     faces_recognised=recognised, people_added=len(added), people_names=added,
+                     people_present=people_on(client, row["asset_id"]))
     return still_waiting
 
 
@@ -1035,7 +1048,7 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
             log.info("  debug frames saved in %s", debug_folder)
         if not chosen:
             state.record(video, "done", candidates=len(candidates), frames=0, faces_found=0,
-                         faces_recognised=0, people_added=0)
+                         faces_recognised=0, people_added=0, people_present=people_on(client, video["id"]))
             log.info("  no faces in this video, nothing uploaded")
             return True
 
@@ -1087,7 +1100,8 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
             lines += ["", f"people added to the video: {', '.join(added) or 'none'}"]
             (debug_folder / "summary.txt").write_text("\n".join(lines) + "\n")
         state.record(video, "done", candidates=len(candidates), frames=len(uploaded), faces_found=found,
-                     faces_recognised=recognised, people_added=len(added), people_names=added)
+                     faces_recognised=recognised, people_added=len(added), people_names=added,
+                     people_present=people_on(client, video["id"]))
         return True
     except Exception as e:
         log.error("  failed: %s", e)
@@ -1242,20 +1256,26 @@ def build_report(state: State, since: str) -> str:
         f"Volti trovati da Immich: {faces} ({recognised} riconosciuti)",
     ]
 
-    per_person: Dict[str, int] = {}
-    unnamed = 0
-    for r in with_people:
-        for person in {n.strip() for n in r["people_names"].split(",")}:
-            if person == "unnamed":
-                unnamed += 1
-            else:
-                per_person[person] = per_person.get(person, 0) + 1
-    if per_person or unnamed:
-        lines += ["", "👤 Persone aggiunte ai video:"]
-        for person, count in sorted(per_person.items(), key=lambda kv: (-kv[1], kv[0])):
-            lines.append(f"• {person}: in {count} video")
-        if unnamed:
-            lines.append(f"• persone senza nome in Immich: in {unnamed} video")
+    def count(column: str) -> Tuple[Dict[str, int], int]:
+        named: Dict[str, int] = {}
+        unnamed = 0
+        for r in done:
+            for person in {n.strip() for n in (r[column] or "").split(",") if n.strip()}:
+                if person == "unnamed":
+                    unnamed += 1
+                else:
+                    named[person] = named.get(person, 0) + 1
+        return named, unnamed
+
+    present, present_unnamed = count("people_present")
+    added_by_scan, _ = count("people_names")
+    if present or present_unnamed:
+        lines += ["", f"👤 Persone presenti nei {len(done)} video:"]
+        for person, n in sorted(present.items(), key=lambda kv: (-kv[1], kv[0])):
+            extra = f" (aggiunto stanotte in {added_by_scan[person]})" if added_by_scan.get(person) else ""
+            lines.append(f"• {person}: in {n} video{extra}")
+        if present_unnamed:
+            lines.append(f"• persone senza nome in Immich: in {present_unnamed} video")
     if with_people:
         lines += ["", "🎞 Dettaglio:"]
         for r in with_people[:15]:
