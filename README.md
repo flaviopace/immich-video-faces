@@ -140,6 +140,9 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 | `FACE_FILTER` | `auto` | `auto` checks frames on the Pi; `off` uploads without checking |
 | `MIN_FACE_PX` | `20` | smaller faces are ignored |
 | `FACE_SCORE` | `0.9` | Pi detector confidence needed to count a face |
+| `SHORT_VIDEO_INTERVAL` | `0` (off) | check short videos every this many seconds instead of `CANDIDATE_INTERVAL` (e.g. `0.1`): a 2 s video gets 20 chances instead of 4 |
+| `SHORT_VIDEO_SECONDS` | `10` | videos up to this length count as short |
+| `ZOOM_FACES_BELOW` | `0` (off) | also upload an enlarged crop of every face smaller than this many pixels (e.g. `80`). Experimental: doubles the uploads, small gain in testing |
 | `FRAMES_PER_VIDEO` | `60` | max frames with faces uploaded per video (~250 KB each, deleted after) |
 | `FRAME_MAX_SIZE` | `1440` | longest side of uploaded frames |
 | `ALBUM_PREFIX` | `Video faces` | per-video album: `<prefix> <date time> <video name>` |
@@ -161,6 +164,8 @@ All settings go in `~/.config/immich-video-faces.env` (see [`config.example.env`
 | `--retry-failed` | scan again the videos that failed `MAX_ATTEMPTS` times |
 | `--forget ID` | mark one video as not scanned |
 | `--keep-frames` | leave the frames and album in Immich until the next run, to inspect them |
+| `--short-interval SECONDS` | override `SHORT_VIDEO_INTERVAL` for this run |
+| `--zoom-below PX` | override `ZOOM_FACES_BELOW` for this run |
 | `--debug-dir DIR` | save every checked frame (green box = face counted, orange = ignored) in `DIR/<date>_<video>/`, with `UPLOADED_` in front of the uploaded ones and a `summary.txt` of what Immich found |
 | `--env-file PATH` | use another config file |
 | `-v` | verbose logs |

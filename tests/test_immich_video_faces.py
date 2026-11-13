@@ -34,6 +34,50 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(ivf.parse_duration(None), 0.0)
         self.assertEqual(ivf.parse_duration("garbage"), 0.0)
 
+    def test_zoom_region(self):
+        # 40px face in a 1280x720 frame: 160px square around it, enlarged 4x
+        x0, y0, side, scale = ivf.zoom_region((520, 260, 38, 40, 0.99, True), 1280, 720, 1440)
+        self.assertEqual((side, scale), (160, 4.0))
+        self.assertEqual((x0, y0), (459, 200))  # centred on the face
+        # face in a corner: the square is moved inside the frame
+        x0, y0, side, _ = ivf.zoom_region((0, 0, 40, 40, 0.99, True), 1280, 720, 1440)
+        self.assertEqual((x0, y0, side), (0, 0, 160))
+        x0, y0, side, _ = ivf.zoom_region((1250, 690, 30, 30, 0.99, True), 1280, 720, 1440)
+        self.assertEqual((x0 + side, y0 + side), (1280, 720))
+        # a face that is already large is not enlarged
+        self.assertIsNone(ivf.zoom_region((100, 100, 150, 150, 0.99, True), 1280, 720, 1440))
+
+    def test_to_frame_coords(self):
+        face = {"imageWidth": 640, "imageHeight": 640, "boundingBoxX1": 240, "boundingBoxY1": 200,
+                "boundingBoxX2": 400, "boundingBoxY2": 380, "person": {"id": "p"}}
+        self.assertIs(ivf.to_frame_coords(face, None), face)
+        moved = ivf.to_frame_coords(face, (459, 200, 4.0, 1280, 720))
+        self.assertEqual((moved["imageWidth"], moved["imageHeight"]), (1280, 720))
+        self.assertEqual((moved["boundingBoxX1"], moved["boundingBoxY1"]), (519, 250))
+        self.assertEqual((moved["boundingBoxX2"], moved["boundingBoxY2"]), (559, 295))
+        self.assertEqual(moved["person"], {"id": "p"})
+
+    def test_frame_names(self):
+        self.assertTrue(ivf.FRAME_NAME_RE.fullmatch("20260828_194418_t000.5s.jpg"))
+        self.assertTrue(ivf.FRAME_NAME_RE.fullmatch("20260828_194418_t000.5s_z2.jpg"))
+        self.assertFalse(ivf.FRAME_NAME_RE.fullmatch("20260828_194418.jpg"))
+        self.assertFalse(ivf.FRAME_NAME_RE.fullmatch("20260828_194418_t000.5s_zoom.jpg"))
+
+    def test_short_videos_checked_densely(self):
+        calls = []
+
+        def fake_one_pass(source, input_args, interval, *rest):
+            calls.append(interval)
+            return ["frame"]
+
+        cfg = ivf.Config(url="u", api_key="k", short_video_interval=0.1)
+        with mock.patch.object(ivf, "grab_one_pass", fake_one_pass):
+            ivf.grab_frames("src", [], 1.7, cfg, True, "v", Path("."))   # short: every 0.1s
+            ivf.grab_frames("src", [], 30.0, cfg, True, "v", Path("."))  # normal: every 0.5s
+            cfg.short_video_interval = 0
+            ivf.grab_frames("src", [], 1.7, cfg, True, "v", Path("."))   # option off
+        self.assertEqual(calls, [0.1, 0.5, 0.5])
+
     def test_frame_times(self):
         times = ivf.frame_times(100, 24)
         self.assertEqual(len(times), 24)

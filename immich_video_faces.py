@@ -38,7 +38,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 log = logging.getLogger("immich-video-faces")
 
@@ -49,7 +49,10 @@ DEFAULT_STATE_DB = Path.home() / ".local" / "share" / "immich-video-faces" / "st
 # Every album this script creates has a description starting with this text
 ALBUM_DESCRIPTION = "Temporary frames from immich-video-faces"
 # Name of every frame this script uploads, e.g. 20261108_180800_t010.0s.jpg
-FRAME_NAME_RE = re.compile(r".+_t\d{3,}\.\ds\.jpg")
+FRAME_NAME_RE = re.compile(r".+_t\d{3,}\.\ds(_z\d+)?\.jpg")  # _zN = zoomed crop of face N
+ZOOM_CONTEXT = 4.0  # crop side = this many times the face size
+ZOOM_TARGET_FACE = 160  # enlarge until the face is about this many pixels...
+ZOOM_MAX_SCALE = 4.0  # ...but never more than this
 
 # Immich's chain of background jobs for an uploaded photo, in order. Face recognition comes last,
 # with one job per face (archived photos get a second, "deferred" recognition job).
@@ -77,6 +80,9 @@ class Config:
     frame_max_size: int = 1440  # longest side; Immich analyses a 1440px preview anyway
     face_filter: str = "auto"  # auto: check frames with OpenCV if installed | off: upload without checking
     min_face_px: int = 20  # smaller faces are ignored
+    zoom_below_px: int = 0  # also upload an enlarged crop of faces smaller than this (0 = off)
+    short_video_seconds: float = 10  # videos up to this length...
+    short_video_interval: float = 0  # ...are checked every this many seconds (0 = off)
     face_score: float = 0.9  # Pi detector confidence needed to count a face
     album_prefix: str = "Video faces"
     debug_dir: Optional[Path] = None  # keep annotated frames here for inspection
@@ -134,6 +140,9 @@ def build_config(args: argparse.Namespace) -> Config:
     cfg.face_filter = env.get("FACE_FILTER", cfg.face_filter).strip().lower()
     cfg.min_face_px = int(env.get("MIN_FACE_PX", cfg.min_face_px))
     cfg.face_score = float(env.get("FACE_SCORE", cfg.face_score))
+    cfg.zoom_below_px = int(env.get("ZOOM_FACES_BELOW") or cfg.zoom_below_px)
+    cfg.short_video_seconds = float(env.get("SHORT_VIDEO_SECONDS") or cfg.short_video_seconds)
+    cfg.short_video_interval = float(env.get("SHORT_VIDEO_INTERVAL") or cfg.short_video_interval)
     cfg.album_prefix = env.get("ALBUM_PREFIX", cfg.album_prefix).strip() or cfg.album_prefix
     if env.get("DEBUG_DIR"):
         cfg.debug_dir = Path(env["DEBUG_DIR"]).expanduser()
@@ -151,6 +160,10 @@ def build_config(args: argparse.Namespace) -> Config:
         cfg.frames_per_video = args.frames
     if args.keep_frames:
         cfg.keep_frames = True
+    if args.zoom_below is not None:
+        cfg.zoom_below_px = args.zoom_below
+    if args.short_interval is not None:
+        cfg.short_video_interval = args.short_interval
     if args.debug_dir:
         cfg.debug_dir = args.debug_dir.expanduser()
     return cfg
@@ -630,6 +643,8 @@ def grab_frames(source: str, input_args: List[str], duration: float, cfg: Config
         return grab_seeking(source, input_args, duration, cfg.frames_per_video, stem, workdir, cfg.frame_max_size)
     if duration <= cfg.one_pass_max_seconds:
         interval = cfg.candidate_interval
+        if cfg.short_video_interval > 0 and 0 < duration <= cfg.short_video_seconds:
+            interval = min(interval, cfg.short_video_interval)  # short video: few frames, check them densely
         if duration > 0:
             interval = max(interval, duration / cfg.candidate_max)
         frames = grab_one_pass(source, input_args, interval, cfg.candidate_max, stem, workdir, cfg.frame_max_size)
@@ -723,6 +738,66 @@ def select_frames(frames: List[Frame], limit: int) -> List[Frame]:
         if current is None or (len(frame.faces), sum(frame.faces)) > (len(current.faces), sum(current.faces)):
             best[slot] = frame
     return sorted(best.values(), key=lambda f: f.at)
+
+
+def zoom_region(box: Tuple, width: int, height: int, max_size: int) -> Optional[Tuple[int, int, int, float]]:
+    """Square region around a small face and how much to enlarge it: (x0, y0, side, scale).
+    None when enlarging would not help (face already big, or no room around it)."""
+    x, y, w, h = box[:4]
+    face = max(w, h)
+    if face <= 0:
+        return None
+    side = int(min(face * ZOOM_CONTEXT, width, height))
+    scale = min(ZOOM_MAX_SCALE, ZOOM_TARGET_FACE / face, max_size / side)
+    if scale < 1.5:
+        return None
+    x0 = int(min(max(x + w / 2 - side / 2, 0), width - side))
+    y0 = int(min(max(y + h / 2 - side / 2, 0), height - side))
+    return x0, y0, side, scale
+
+
+def write_zoom_crops(cv2, frames: List["Frame"], below_px: int, max_size: int, limit: int) -> List[Tuple[Path, Tuple]]:
+    """Enlarged crops of the small faces in `frames`, as [(path, (x0, y0, scale, width, height))].
+    Immich looks for faces on a copy shrunk to 640px, where a 40px face is too small to match well;
+    in the crop the same face is 3-4 times larger."""
+    crops = []
+    for frame in frames:
+        small = [b for b in frame.boxes if b[5] and max(b[2], b[3]) < below_px]
+        if not small:
+            continue
+        img = cv2.imread(str(frame.path))
+        if img is None:
+            continue
+        height, width = img.shape[:2]
+        for n, box in enumerate(small, 1):
+            region = zoom_region(box, width, height, max_size)
+            if region is None:
+                continue
+            x0, y0, side, scale = region
+            out = cv2.resize(img[y0:y0 + side, x0:x0 + side], None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_CUBIC)
+            dest = frame.path.with_name(f"{frame.path.stem}_z{n}.jpg")
+            if cv2.imwrite(str(dest), out, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+                crops.append((dest, (x0, y0, scale, width, height)))
+    if len(crops) > limit > 0:  # spread over the video
+        crops = [crops[i * len(crops) // limit] for i in range(limit)]
+    return crops
+
+
+def to_frame_coords(face: dict, zoom: Optional[Tuple]) -> dict:
+    """A face Immich found in a zoomed crop, with its box moved back to where it is in the full frame."""
+    if not zoom:
+        return face
+    x0, y0, scale, width, height = zoom
+    return {
+        **face,
+        "imageWidth": width,
+        "imageHeight": height,
+        "boundingBoxX1": round(x0 + face["boundingBoxX1"] / scale),
+        "boundingBoxX2": round(x0 + face["boundingBoxX2"] / scale),
+        "boundingBoxY1": round(y0 + face["boundingBoxY1"] / scale),
+        "boundingBoxY2": round(y0 + face["boundingBoxY2"] / scale),
+    }
 
 
 def work_dir(label: str) -> Path:
@@ -1043,8 +1118,16 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
                      ", ".join(f"{f.at:g}s ({len(f.faces)})" for f in chosen) or "-")
         else:
             chosen = candidates
+        zooms: Dict[Path, Tuple] = {}
+        if cfg.zoom_below_px > 0 and getattr(finder, "cv2", None):
+            zooms = dict(write_zoom_crops(finder.cv2, chosen, cfg.zoom_below_px, cfg.frame_max_size,
+                                          cfg.frames_per_video))
+            if zooms:
+                log.info("  %d enlarged crop(s) of faces under %dpx", len(zooms), cfg.zoom_below_px)
         if debug_folder:
             write_debug_frames(debug_folder, candidates, chosen)
+            for crop in zooms:
+                shutil.copy(crop, debug_folder / f"ZOOM_{crop.name}")
             log.info("  debug frames saved in %s", debug_folder)
         if not chosen:
             state.record(video, "done", candidates=len(candidates), frames=0, faces_found=0,
@@ -1054,15 +1137,18 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
 
         created_at = video.get("fileCreatedAt") or dt.datetime.now(dt.timezone.utc).isoformat()
         names = {}
-        for frame in chosen:
-            asset_id, status = client.upload_frame(frame.path, created_at)
+        zoom_of: Dict[str, Tuple] = {}
+        for path in [f.path for f in chosen] + list(zooms):
+            asset_id, status = client.upload_frame(path, created_at)
             if status == "duplicate" and not state.is_pending_delete(asset_id):
                 # Same file already in Immich and not uploaded by us: leave it alone.
-                log.warning("  %s already exists in Immich as %s, skipping it", frame.path.name, asset_id)
+                log.warning("  %s already exists in Immich as %s, skipping it", path.name, asset_id)
                 continue
-            state.add_pending_delete(asset_id, video["id"], frame.path.name, file_checksum(frame.path))
+            state.add_pending_delete(asset_id, video["id"], path.name, file_checksum(path))
             uploaded.append(asset_id)
-            names[asset_id] = frame.path.name
+            names[asset_id] = path.name
+            if path in zooms:
+                zoom_of[asset_id] = zooms[path]
         if not uploaded:
             raise RuntimeError("no frame could be uploaded")
         album_name = f"{cfg.album_prefix} {started:%Y-%m-%d %H:%M} {name}"
@@ -1091,6 +1177,8 @@ def process_video(client: ImmichClient, state: State, cfg: Config, finder: Optio
         recognised = sum(1 for faces in frame_faces.values() for f in faces if f.get("person"))
         for asset_id, faces in frame_faces.items():
             log.info("    %s: %s", names[asset_id], describe_faces(faces))
+        # faces from zoomed crops: put their box back where it is in the video frame
+        frame_faces = {a: [to_frame_coords(f, zoom_of.get(a)) for f in faces] for a, faces in frame_faces.items()}
         added = copy_people_to_video(client, video["id"], frame_faces)
         log.info("  %d face(s) found by Immich, %d recognised, people added to video: %s",
                  found, recognised, ", ".join(added) if added else "none")
@@ -1347,6 +1435,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="send the summary since the last report to Telegram (with --dry-run: print it)")
     parser.add_argument("--keep-frames", action="store_true",
                         help="leave frames and album in Immich until the next run, to inspect them")
+    parser.add_argument("--zoom-below", type=int, metavar="PX",
+                        help="also upload an enlarged crop of faces smaller than PX pixels (0 = off)")
+    parser.add_argument("--short-interval", type=float, metavar="SECONDS",
+                        help="check short videos (up to SHORT_VIDEO_SECONDS, default 10) every SECONDS (0 = off)")
     parser.add_argument("--debug-dir", type=Path,
                         help="save every checked frame (faces drawn on it) in a dated folder per video")
     parser.add_argument("--forget", metavar="VIDEO_ID", help="mark a video as not scanned")
